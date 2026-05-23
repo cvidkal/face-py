@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Build artifacts
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Claude harness
+.claude/
+
+# Models (>5MB, ship via separate download or docker bake)
+models/*.onnx
+models/*.pt
+models/*.bin
+models/*.xml
+!models/.gitkeep
+
+# Runtime data (segmentation outputs, etc.)
+outputs/
+data/
+
+# ORT C++ release artifacts (downloaded by setup script, not committed)
+.deps/

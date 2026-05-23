@@ -1,0 +1,14 @@
+# face-py runtime dependencies.
+#
+# 跟 cloth/day_night 同款 pin pattern: 留宽松版本上界给安全补丁, 不锁小版本.
+# 全部都是离线 bundle build 时 pip download → 客户机 pip install --no-index 装的.
+
+# ONNX Runtime + CUDA 12 execution provider. 1.23.x 是我们 feasibility 测过的版本
+# (T4 / CUDA 12.8 / cuDNN 9), 数值跟 CPU 等价 cosine = 1.0.
+onnxruntime-gpu>=1.23,<2.0
+
+# OpenCV: headless build, 不要 GUI 依赖. 跟 cloth 同款.
+opencv-python-headless>=4.10,<5.0
+
+# numpy (transitive via opencv + onnxruntime), 显式 pin 一个稳定大版本
+numpy>=1.26,<3.0
