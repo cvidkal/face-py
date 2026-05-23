@@ -23,6 +23,8 @@ from typing import Any
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+from module.face.pipeline import FacePipeline, build_pipeline_from_env  # noqa: E402
+
 
 DEFAULT_PORT = 32192   # face C++ 占 32186, face-py 走 32192
 
@@ -90,6 +92,7 @@ class Handler(BaseHTTPRequestHandler):
     started_at: float = 0.0
     log: logging.Logger
     log_request_bodies: bool = False
+    pipeline: FacePipeline  # set by main() before serve_forever
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         # 默认 access log 太吵, 我们用 self.log 自己 emit 结构化日志.
@@ -174,10 +177,20 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request"); return
         request_id = str(body.get("request_id", "") or uuid.uuid4())
 
-        # Phase A.1: stub. Phase A.2 接 pipeline.identity_check(image_path, ref_image_path).
-        self._error(HTTPStatus.NOT_IMPLEMENTED,
-                    "identity_check not yet implemented in Phase A.1 (skeleton commit). "
-                    "Pipeline lands in Phase A.2.", request_id, "not_implemented")
+        image_path = str(body.get("image_path", ""))
+        ref_image_path = str(body.get("ref_image_path", ""))
+        if not image_path:
+            self._error(HTTPStatus.BAD_REQUEST,
+                         "Field 'image_path' required (non-empty string)",
+                         request_id, "invalid_request"); return
+        if not ref_image_path:
+            self._error(HTTPStatus.BAD_REQUEST,
+                         "Field 'ref_image_path' required (non-empty string)",
+                         request_id, "invalid_request"); return
+
+        # face C++ identity_check 返 200 + error_code 字段 (业务级失败不抛 HTTP 5xx).
+        result = self.pipeline.identity_check(image_path, ref_image_path)
+        self._write_json(HTTPStatus.OK, result.to_json())
 
     def _handle_compare(self) -> None:
         request_id = ""
@@ -190,9 +203,15 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request"); return
         request_id = str(body.get("request_id", "") or uuid.uuid4())
 
-        self._error(HTTPStatus.NOT_IMPLEMENTED,
-                    "compare not yet implemented in Phase A.1. Lands in Phase A.3.",
-                    request_id, "not_implemented")
+        image_a = str(body.get("image_a_path", ""))
+        image_b = str(body.get("image_b_path", ""))
+        if not image_a or not image_b:
+            self._error(HTTPStatus.BAD_REQUEST,
+                         "Fields 'image_a_path' and 'image_b_path' required",
+                         request_id, "invalid_request"); return
+
+        result = self.pipeline.compare(image_a, image_b)
+        self._write_json(HTTPStatus.OK, result.to_json())
 
 
 # =============================================================================
@@ -224,6 +243,15 @@ def main() -> int:
     Handler.started_at = time.time()
     Handler.log = log
     Handler.log_request_bodies = env_bool("FACE_LOG_REQUEST_BODIES", False)
+
+    # Build pipeline (loads ONNX models + creates CUDA session). This is slow
+    # (~1-2s GPU warmup), so we do it once at startup, not per request.
+    log.info(json.dumps({"event": "pipeline_init"}))
+    Handler.pipeline = build_pipeline_from_env()
+    log.info(json.dumps({
+        "event": "pipeline_ready",
+        "providers": Handler.pipeline.recognizer.providers,
+    }))
 
     log.info(json.dumps({
         "event": "starting", "host": host, "port": port,
