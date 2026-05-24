@@ -69,20 +69,43 @@
   "elapsed_ms": 5.4 }
 ```
 
-响应 (per-photo 错误路径, 跟 face C++ 同款 error_code 枚举):
-- `no_face` — face_count = 0, 没检到脸 (此分支 cosine/l2 不填; clarity 不填)
-- `pose_excessive` — yaw > 0.35 OR pitch > 0.55 (跟 face C++ #13 patch 后阈值对齐;
-  此分支 cosine/l2 不填; clarity 不填 — face C++ line ~2616 行为)
-- `image_read_failed` / `ref_image_read_failed` — opencv 读图失败 (此分支带 clarity_score)
-- `feature_extraction_failed` — embedding 抽取异常 (此分支带 clarity_score)
+响应 (per-photo 错误路径):
+- `no_face` — YuNet 没检到任何 face
+- `image_read_failed` / `ref_image_read_failed` — opencv 读图失败
+- `feature_extraction_failed` — embedding 抽取异常 (catch-all)
+- `pose_excessive` — yaw > 0.35 OR pitch > 0.55 (跟 face C++ #13 patch 后默认对齐)
+- `detection_low_confidence` (**Phase A.5 新**) — YuNet 自己 score < 0.88, 检测不可信
+- `face_too_small` (**A.5 新**) — bbox min(w,h) < 40px, SFace 输入向上 upscale 不稳
+- `face_too_blurry` (**A.5 新**) — aligned 112×112 crop Laplacian variance < 30
+- `cos_inconclusive_zone` (**A.5 新**) — cos ∈ [0.15, 0.30) 中间区, 拿不准就不报
 
-`match_status` ∈ `{match, mismatch, inconclusive}`. 阈值 `FACE_COSINE_THRESH` (默认
-**0.30**, Phase A.4 重 tune 后, 见 docs/cross_validation_v0_4_0.md) + `FACE_L2_THRESH`
-(默认 **1.10**) — 注意跟 face C++ 默认 0.4/1.0 **不一样**, 因 SFace 跟
-face-reidentification-retail-0095 cos 分布偏移 ~ -0.10.
+**决策三态** (`match_status`):
+```
+cos < FACE_COSINE_MISMATCH_THRESH (默认 0.15)        → mismatch  (高置信不像)
+cos ≥ FACE_COSINE_THRESH (默认 0.30) AND l2 ≤ 1.15  → match     (高置信像)
+else                                                  → inconclusive
+```
 
-切到 face-py 时 TA 端 `FACE_COSINE_THRESH` env **必须同步切**, 否则带 face C++ 的
-0.4 阈值打 face-py 会得到 55% 决策一致率 (Phase A.4 实测).
+阈值默认值跟 face C++ **不通用**:
+- face C++ 默认 cos 0.4 / l2 1.0 (face-reid-retail-0095, 256-d)
+- face-py 默认 cos 0.30 / l2 1.15 (SFace 128-d, cos 系统性偏低 ~0.10)
+
+切到 face-py 时 TA 端**不需要**改 FACE_COSINE_THRESH — TA 只看 has_identity_anomaly,
+来自 face-py 的 match_status="mismatch" 触发. face C++ 部署如果还在跑, 它继续用自己
+的 env, 互不干扰.
+
+**实测在 322 photo customer ground truth (1 真造假 + 39 clean)** (docs/cross_validation_v0_4_0.md):
+
+| | face C++ baseline | face-py A.5 |
+|---|---|---|
+| Recall (catch 真造假) | 100% | **100%** |
+| Specificity (clean session 不误报) | 92.3% | **94.9%** |
+| Accuracy | 92.5% | **95.0%** |
+| photo-level inconclusive rate | ~10% | 23% |
+
+哲学: "图像质量不行就明确说不行" — face-py 主动用 quality gates 拒绝在不可信数据上猜
+match/mismatch. 客户拿到的 anomaly 比 face C++ 更可信 (FP 少), 代价是 13 pp 更多 photo
+走 inconclusive (但这是诚实, 比"错报代训"破坏性小一万倍).
 
 ### `POST /api/v1/face/compare`
 
@@ -110,9 +133,12 @@ face-reidentification-retail-0095 cos 分布偏移 ~ -0.10.
 | `FACE_HTTP_PORT` | 32192 | face C++ 占 32186, face-py 走 32192 |
 | `FACE_HTTP_AUTH_TOKEN` | (empty) | 配了就启 auth, 跟 face C++ 同协议 (Bearer / X-API-Key) |
 | `FACE_HTTP_AUTH_REQUIRED` | auto | 跟 `auth_token` 非空联动 |
-| `FACE_COSINE_THRESH` | **0.30** | match 阈值. **跟 face C++ 默认 0.4 不一样** (Phase A.4 重 tune) |
-| `FACE_L2_THRESH` | **1.10** | match l2 阈值. 同上 |
-| `FACE_COSINE_INCONCLUSIVE_THRESH` | 0.20 | inconclusive 中间区下界, face#13 中间区相对 cos 阈值 - 0.1 |
+| `FACE_COSINE_MISMATCH_THRESH` | **0.15** | cos < 此值 → mismatch (Phase A.5) |
+| `FACE_COSINE_THRESH` | **0.30** | cos ≥ 此值 + l2 OK → match. 跟 face C++ 默认 0.4 不通用 |
+| `FACE_L2_THRESH` | **1.15** | match 要求的 l2 上限 |
+| `FACE_DET_SCORE_MIN` | **0.88** | YuNet det_score < 此值 → inconclusive (Phase A.5) |
+| `FACE_BBOX_MIN_PX` | **40** | bbox min(w,h) < 此值 → inconclusive (Phase A.5) |
+| `FACE_CROP_CLARITY_MIN` | **30** | aligned crop Laplacian var < 此值 → inconclusive (Phase A.5) |
 | `FACE_DETECT_MODEL_PATH` | models/face_detection_yunet_2023mar.onnx | YuNet |
 | `FACE_RECOGNIZE_MODEL_PATH` | models/face_recognition_sface_2021dec.onnx | SFace |
 | `FACE_DEVICE` | cuda | "cuda" / "cpu". cuda 走 CUDAExecutionProvider, 没卡时 fallback cpu |
@@ -129,6 +155,29 @@ face-reidentification-retail-0095 cos 分布偏移 ~ -0.10.
 - face_count **总是**填 (即便 no_face → 0; ref 读失败 → undefined 但 schema 里仍要 emit)
 
 这些行为 1:1 抄 `/home/algo/face/service/face_http_server.cpp:process_training_photo` (line ~2580-2640) + `face-detection-0205` + recognizer 错误处理. 改任何一条都要先验证客户端 (TA `_populate_identity`) 不依赖.
+
+## 决策语义 — quality gates 哲学
+
+**核心 framing** (Phase A.5 引入): "图像质量不行就明确说不行".
+
+face C++ 之前的行为依赖 face-detection-0205 偶然偏保守 (低质量图常返 no_face), 让"看
+不清就不报警" 是 implicit 后果. face-py 选择 YuNet 检测更敏感, 检到的 face 更多, 这
+本来是好事 — 但直接套用单 cos threshold 会让低质量 photo (模糊 / 太小 / 远 / 极端
+pose) 上的不稳定 embedding 触发 mismatch, 错报代训 (Phase A.4 失败教训, specificity
+跌到 54%).
+
+A.5 redesign 走的路:
+1. **显式 quality gates** (detector confidence / face size / aligned-crop clarity /
+   pose) — 任一不过, 直接 inconclusive, 不参与 cos 决策
+2. **cos 中间区**: 即便过了 quality gates, cos ∈ [0.15, 0.30) 也走 inconclusive
+3. 只有 quality 好 + cos 极端 (< 0.15 OR ≥ 0.30) 才下 match/mismatch 结论
+
+实测结果: recall 100% (catch 真造假), specificity 94.9% (vs face C++ 92.3%), 代价是
+photo-level inconclusive 23% (vs face C++ ~10%). **多 13 pp inconc** 换 **少 1 个 false
+positive 学员被错查**.
+
+跟客户的话术: "AI 在能看清的 photo 上做了决定, 看不清的 photo 明确标 inconclusive 让
+你决定要不要人工复核, 不会把好学员错报代训."
 
 ## v0.4.0 验证计划
 

@@ -10,7 +10,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from module.face.recognizer import (
-    cosine_score, get_match_thresholds, is_same_person, l2_distance,
+    classify_match, cosine_score, get_match_thresholds, is_same_person,
+    l2_distance,
 )
 
 
@@ -37,49 +38,66 @@ class CosineL2Test(unittest.TestCase):
 
 
 class IsSamePersonTest(unittest.TestCase):
-    """注: v0.4.0 默认阈值是 cos=0.30 / l2=1.10 (Phase A.4 重 tune 后), 不是
-    face C++ 的 0.40 / 1.0. 见 docs/cross_validation_v0_4_0.md.
+    """Phase A.5: tri-state classify_match (mismatch zone / match zone / inconclusive gap).
+
+    Defaults: cos_mismatch=0.15, cos_match=0.30, l2_max=1.15.
+    is_same_person (bool) 仍然提供给 /face/compare 用 (单 cos_match threshold).
     """
 
     def setUp(self) -> None:
-        for k in ("FACE_COSINE_THRESH", "FACE_L2_THRESH"):
+        for k in ("FACE_COSINE_THRESH", "FACE_COSINE_MISMATCH_THRESH", "FACE_L2_THRESH"):
             os.environ.pop(k, None)
 
     def test_default_thresholds(self) -> None:
-        cos_t, l2_t = get_match_thresholds()
-        self.assertAlmostEqual(cos_t, 0.30)
-        self.assertAlmostEqual(l2_t, 1.10)
+        cos_lo, cos_hi, l2_max = get_match_thresholds()
+        self.assertAlmostEqual(cos_lo, 0.15)
+        self.assertAlmostEqual(cos_hi, 0.30)
+        self.assertAlmostEqual(l2_max, 1.15)
 
-    def test_high_cos_low_l2_match(self) -> None:
-        # cos=0.55, l2=0.9 — 远高于 0.30, 远低于 1.10
-        self.assertTrue(is_same_person(0.55, 0.9))
+    # classify_match (tri-state)
 
-    def test_low_cos_no_match(self) -> None:
-        # cos=0.25 < 0.30
-        self.assertFalse(is_same_person(0.25, 0.9))
+    def test_classify_high_cos_match(self) -> None:
+        # cos=0.55, l2=0.9 — 远高于 0.30 + l2 OK
+        self.assertEqual(classify_match(0.55, 0.9), "match")
 
-    def test_high_l2_no_match(self) -> None:
-        # 即便 cos 高, l2 越线就 mismatch (跟 face C++ AND 关系)
-        self.assertFalse(is_same_person(0.55, 1.15))
+    def test_classify_low_cos_mismatch(self) -> None:
+        # cos=0.10 < 0.15
+        self.assertEqual(classify_match(0.10, 0.9), "mismatch")
 
-    def test_boundary_at_threshold(self) -> None:
-        # cos 恰等于 0.30 应该 match (>=), l2 恰等于 1.10 应该 match (<=)
-        self.assertTrue(is_same_person(0.30, 1.10))
+    def test_classify_gap_inconclusive(self) -> None:
+        # cos=0.20 ∈ [0.15, 0.30), 中间区
+        self.assertEqual(classify_match(0.20, 0.9), "inconclusive")
+        # 边界: cos 恰等于 0.15 — 不是 mismatch (>=), 是 inconclusive
+        self.assertEqual(classify_match(0.15, 0.9), "inconclusive")
+        # 边界: cos 恰等于 0.30 + l2 OK — match
+        self.assertEqual(classify_match(0.30, 1.0), "match")
 
-    def test_explicit_threshold_override(self) -> None:
-        # 提高 cos 阈值到 0.6, 同 cos 0.55 变 mismatch
-        self.assertFalse(is_same_person(0.55, 0.9, cos_thresh=0.6))
+    def test_classify_high_l2_blocks_match(self) -> None:
+        # cos 够高但 l2 越线 — 不算 match. 也不算 mismatch (cos 不够低). → inconclusive
+        self.assertEqual(classify_match(0.55, 1.20), "inconclusive")
 
-    def test_env_override(self) -> None:
-        os.environ["FACE_COSINE_THRESH"] = "0.5"
+    def test_classify_low_cos_overrides_l2(self) -> None:
+        # cos 极低 — 即使 l2 OK 也判 mismatch (cos 优先)
+        self.assertEqual(classify_match(0.05, 0.5), "mismatch")
+
+    def test_classify_explicit_override(self) -> None:
+        # 把 cos_match 调到 0.6: 原来 0.55 是 match 现在变 inconclusive
+        self.assertEqual(classify_match(0.55, 0.9, cos_match_thresh=0.6), "inconclusive")
+
+    def test_classify_env_override(self) -> None:
+        os.environ["FACE_COSINE_MISMATCH_THRESH"] = "0.25"
         try:
-            cos_t, l2_t = get_match_thresholds()
-            self.assertAlmostEqual(cos_t, 0.5)
-            self.assertAlmostEqual(l2_t, 1.10)
-            self.assertFalse(is_same_person(0.45, 0.9))
-            self.assertTrue(is_same_person(0.55, 0.9))
+            # cos=0.22 < 0.25 现在算 mismatch (默认 0.15 时它是 inconclusive)
+            self.assertEqual(classify_match(0.22, 0.9), "mismatch")
         finally:
-            os.environ.pop("FACE_COSINE_THRESH", None)
+            os.environ.pop("FACE_COSINE_MISMATCH_THRESH", None)
+
+    # is_same_person (legacy bool, 给 /face/compare 用)
+
+    def test_is_same_person_default(self) -> None:
+        self.assertTrue(is_same_person(0.30, 1.0))     # 恰到阈值
+        self.assertFalse(is_same_person(0.29, 1.0))    # cos 差一点
+        self.assertFalse(is_same_person(0.30, 1.20))   # l2 超
 
 
 if __name__ == "__main__":

@@ -24,13 +24,18 @@ import numpy as np
 from .clarity import compute_image_clarity_score
 from .detector import DetectedFace, FaceAligner, FaceDetector, largest_face
 from .errors import (
+    COS_INCONCLUSIVE_ZONE, DETECTION_LOW_CONFIDENCE, FACE_TOO_BLURRY, FACE_TOO_SMALL,
     FEATURE_EXTRACTION_FAILED, IMAGE_READ_FAILED, MSG_NO_FACE, NO_FACE,
     POSE_EXCESSIVE, REF_IMAGE_READ_FAILED,
-    msg_image_read_failed, msg_pose_excessive, msg_ref_image_read_failed,
+    msg_cos_inconclusive_zone, msg_detection_low_confidence, msg_face_too_blurry,
+    msg_face_too_small, msg_image_read_failed, msg_pose_excessive,
+    msg_ref_image_read_failed,
 )
-from .pose_gate import compute_head_pose, is_pose_excessive
+from .pose_gate import compute_head_pose
+from .quality_gate import QualityGateConfig
 from .recognizer import (
-    FaceRecognizer, cosine_score, is_same_person, l2_distance,
+    FaceRecognizer, classify_match, cosine_score, get_match_thresholds,
+    is_same_person, l2_distance,
 )
 
 
@@ -137,25 +142,37 @@ class FacePipeline:
     detector: FaceDetector
     aligner: FaceAligner
     recognizer: FaceRecognizer
+    quality: QualityGateConfig = field(default_factory=QualityGateConfig.from_env)
     ref_cache: RefFeatureCache = field(default_factory=RefFeatureCache)
 
     # ----- identity_check -----
 
     def identity_check(self, image_path: str, ref_image_path: str) -> IdentityCheckResult:
-        """跟 face C++ /face/identity_check handler 1:1 对齐.
+        """Phase A.5 redesign: 显式 quality gates + cos 中间区, 拒绝在不可信数据上猜.
 
-        早返路径 (按 face C++ 顺序):
-        1. cv2.imread(image_path) → None → IMAGE_READ_FAILED, clarity=None
-        2. cv2.imread(ref_image_path) → None → REF_IMAGE_READ_FAILED, clarity=已算
-        3. detect → 空 → NO_FACE, clarity=已算 (但 face C++ no_face 路径**不**填 clarity,
-           按那个行为对齐: success / no_face / pose_excessive 三路径 clarity 不填)
-        4. pose gate → 超阈值 → POSE_EXCESSIVE, clarity 不填
-        5. extract ref + 算 cos/l2 + match_status
+        路径 (按 cost 升序排, gate 早返省 align/extract):
+        1. imread photo → IMAGE_READ_FAILED
+        2. imread ref (或 cache hit, 跳 IO) → REF_IMAGE_READ_FAILED
+        3. detect photo → 空 → NO_FACE
+        4. det_score < 0.88 → DETECTION_LOW_CONFIDENCE (新, Phase A.5)
+        5. bbox 小于 40px → FACE_TOO_SMALL (新)
+        6. pose excessive → POSE_EXCESSIVE
+        7. align (~3ms)
+        8. aligned crop clarity < 30 → FACE_TOO_BLURRY (新)
+        9. extract embedding (~2ms GPU)
+        10. extract ref embedding (cache 复用)
+        11. cos / l2 三态 classify:
+            cos < 0.15                → mismatch
+            cos >= 0.30 AND l2 <= 1.15 → match
+            else                       → COS_INCONCLUSIVE_ZONE (新)
 
-        catch-all: extract / align 抛异常 → FEATURE_EXTRACTION_FAILED, clarity 填
+        全部 gate / inconclusive 路径 match_status="inconclusive", error_code 区分.
+        TA 的 _populate_identity 只看 mismatch 才 trigger has_identity_anomaly, 所以
+        把 "不确定" 都归 inconclusive 是业务安全的.
         """
         result = IdentityCheckResult()
         t0 = time.perf_counter()
+        quality = self.quality
 
         try:
             # 1. 读 photo
@@ -163,15 +180,13 @@ class FacePipeline:
             if image is None or image.size == 0:
                 result.error_code = IMAGE_READ_FAILED
                 result.error = msg_image_read_failed(image_path)
-                # face C++ image_read_failed 路径**填** clarity (无图所以 clarity=None,
-                # 但 schema 里 emit None). 这里跟 face C++ 行为对齐: clarity=None
                 return self._finish(result, t0)
 
-            # face C++ 在 imread 成功后立刻算 clarity, 但仅在错误路径 emit. 我们
-            # 也把它算出来留着, success 路径 to_json 时 clarity 仍 None.
-            clarity = compute_image_clarity_score(image)
+            # face C++ 在 imread 成功后立刻算 image-level clarity, 但仅 error_code
+            # 路径 emit. 我们改为只在 face-too-blurry 时算 aligned-crop clarity (后面),
+            # image-level clarity 一般 dashcam 偏暗也大 — 没区分度. 这里不算.
 
-            # 2. 读 ref (在 detect 前, 跟 face C++ 顺序一致, 防止 cache miss 时再 imread)
+            # 2. 读 ref (或 cache hit)
             cache_key = RefFeatureCache.make_key(ref_image_path)
             cached_ref = self.ref_cache.get(cache_key) if cache_key else None
             ref_image: Optional[np.ndarray] = None
@@ -180,40 +195,67 @@ class FacePipeline:
                 if ref_image is None or ref_image.size == 0:
                     result.error_code = REF_IMAGE_READ_FAILED
                     result.error = msg_ref_image_read_failed(ref_image_path)
-                    # face C++ 这一路径 clarity (photo) 已算出但不 emit (它先 set 了再
-                    # 直接 return). 我们保持一致: clarity 不填.
                     return self._finish(result, t0)
 
-            # 3. detect photo
+            # 3. detect photo (detector 默认 score_threshold=0.3 较松, 让我们看到所有
+            # 候选, gate 决策在下面)
             faces = self.detector.detect(image)
             result.face_count = len(faces)
             primary = largest_face(faces)
             if primary is None:
                 result.error_code = NO_FACE
                 result.error = MSG_NO_FACE
-                # face C++ no_face 不填 clarity (line 4359-4363 直接 return without
-                # setting clarity_score). 我们对齐.
                 return self._finish(result, t0)
 
-            # 4. align + extract photo embedding, 顺便算 pose
+            # 4. detection confidence gate (Phase A.5)
+            if primary.score < quality.det_score_min:
+                result.error_code = DETECTION_LOW_CONFIDENCE
+                result.error = msg_detection_low_confidence(
+                    primary.score, quality.det_score_min)
+                return self._finish(result, t0)
+
+            # 5. face size gate (Phase A.5)
+            bbox_min_side = min(primary.bbox_xywh[2], primary.bbox_xywh[3])
+            if bbox_min_side < quality.face_bbox_min_px:
+                result.error_code = FACE_TOO_SMALL
+                result.error = msg_face_too_small(
+                    bbox_min_side, quality.face_bbox_min_px)
+                return self._finish(result, t0)
+
+            # 6. pose gate (cheap, 算几何不用 inference)
+            pose = compute_head_pose(primary.landmarks)
+            if (abs(pose.yaw_ratio) > quality.yaw_max or
+                    abs(pose.pitch_ratio) > quality.pitch_max):
+                result.error_code = POSE_EXCESSIVE
+                result.error = msg_pose_excessive(pose.yaw_ratio, pose.pitch_ratio)
+                return self._finish(result, t0)
+
+            # 7. align (~3ms) + 8. aligned-crop clarity gate
             try:
                 aligned = self.aligner.align(image, primary)
+            except Exception as exc:
+                result.error_code = FEATURE_EXTRACTION_FAILED
+                result.error = str(exc)
+                return self._finish(result, t0)
+            crop_clarity = compute_image_clarity_score(aligned)
+            if crop_clarity is None or crop_clarity < quality.face_crop_clarity_min:
+                result.error_code = FACE_TOO_BLURRY
+                result.error = msg_face_too_blurry(
+                    crop_clarity or 0.0, quality.face_crop_clarity_min)
+                result.clarity_score = crop_clarity
+                return self._finish(result, t0)
+
+            # 9. extract embedding
+            try:
                 emb_photo = self.recognizer.extract(aligned)
             except Exception as exc:
                 result.error_code = FEATURE_EXTRACTION_FAILED
                 result.error = str(exc)
-                # face C++ catch 路径填 clarity
-                result.clarity_score = clarity
+                result.clarity_score = crop_clarity
                 return self._finish(result, t0)
 
-            pose = compute_head_pose(primary.landmarks)
-            if is_pose_excessive(pose):
-                result.error_code = POSE_EXCESSIVE
-                result.error = msg_pose_excessive(pose.yaw_ratio, pose.pitch_ratio)
-                # face C++ pose_excessive 路径 line 4373-4382, **不**填 clarity.
-                return self._finish(result, t0)
-
-            # 5. extract ref embedding (或用 cache)
+            # 10. extract ref embedding (或 cache 复用). Ref 也走同样 gate — 如果 ref
+            # 图本身就糟, 直接 feature_extraction_failed (cache 不入)
             if cached_ref is not None:
                 emb_ref = cached_ref
             else:
@@ -222,43 +264,35 @@ class FacePipeline:
                     ref_faces = self.detector.detect(ref_image)
                     ref_primary = largest_face(ref_faces)
                     if ref_primary is None:
-                        # face C++ extract_primary 内部 no_face 会抛, 经 classify
-                        # 转 feature_extraction_failed. 这里跟相同语义.
                         raise RuntimeError("No face detected in reference image")
+                    # ref 不走严格 det / size / clarity gate — 客户已经选了 ref 给我们,
+                    # 这是"权威照片", 不该挑剔. 仅 align + extract.
                     ref_aligned = self.aligner.align(ref_image, ref_primary)
                     emb_ref = self.recognizer.extract(ref_aligned)
                 except Exception as exc:
                     result.error_code = FEATURE_EXTRACTION_FAILED
                     result.error = str(exc)
-                    result.clarity_score = clarity
                     return self._finish(result, t0)
-                # 入 cache (仅成功路径才 put — face C++ ref_feature_cache.put 也是
-                # 成功路径才入, line 4391)
                 if cache_key:
                     self.ref_cache.put(cache_key, emb_ref)
 
-            # 6. 算 cos / l2 / match_status
+            # 11. 算 cos / l2 + tri-state classify (Phase A.5)
             cos = cosine_score(emb_photo, emb_ref)
             l2 = l2_distance(emb_photo, emb_ref)
             result.cosine_score = cos
             result.l2_distance = l2
-            result.match_status = "match" if is_same_person(cos, l2) else "mismatch"
+            verdict = classify_match(cos, l2)
+            result.match_status = verdict
+            if verdict == "inconclusive":
+                cos_lo, cos_hi, _ = get_match_thresholds()
+                result.error_code = COS_INCONCLUSIVE_ZONE
+                result.error = msg_cos_inconclusive_zone(cos, cos_lo, cos_hi)
             return self._finish(result, t0)
 
         except Exception as exc:
-            # 兜底 — 任何没预期的异常都按 feature_extraction_failed 处理, 跟 face C++
-            # catch 路径一致. 注意此处不重复算 clarity (上面如果到这, clarity 在
-            # try 块里已经算过或没算过, 我们用本地变量已不可达 — 重新算一次).
+            # 兜底
             result.error_code = FEATURE_EXTRACTION_FAILED
             result.error = str(exc)
-            try:
-                # 重新 imread 一次拿 clarity (face C++ classify_image_validation_failure
-                # 在 catch 块里有 image 引用, 我们这里不一定有)
-                fallback_image = cv2.imread(image_path)
-                if fallback_image is not None:
-                    result.clarity_score = compute_image_clarity_score(fallback_image)
-            except Exception:
-                pass
             return self._finish(result, t0)
 
     # ----- compare (两张图直接比, 无 ref cache, 无 pose gate) -----

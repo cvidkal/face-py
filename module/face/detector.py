@@ -42,9 +42,13 @@ class FaceDetector:
 
     def __init__(self, model_path: str,
                   input_size: tuple[int, int] = (640, 640),
-                  score_threshold: float = 0.6,
+                  score_threshold: float = 0.3,
                   nms_threshold: float = 0.3,
                   top_k: int = 5000):
+        # Note: 默认 score_threshold=0.3 较松, 让 detector 把所有候选 face 都返回.
+        # Quality gating (FACE_DET_SCORE_MIN, 默认 0.88) 在 pipeline 层做, 这样
+        # error_code 路径能区分 no_face (真没检到) vs detection_low_confidence (检到
+        # 但 YuNet 不够信). Phase A.5.
         if not Path(model_path).exists():
             raise FileNotFoundError(f"YuNet model not found: {model_path}")
         self._model_path = model_path

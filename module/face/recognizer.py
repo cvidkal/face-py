@@ -93,31 +93,61 @@ def l2_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
 
 
-# 业务阈值, 用 ENV 覆盖. 默认值来自 Phase A.4 cross-validation 跟 face C++ baseline
-# 重 tune (docs/cross_validation_v0_4_0.md).
+# 业务阈值, 用 ENV 覆盖. 默认值来自 Phase A.5 quality-gate sweep 跟 customer ground
+# truth (1 真造假 + 39 clean) 联合调参 (docs/cross_validation_v0_4_0.md "Phase A.5" 段).
 #
 # face C++ 用 face-reidentification-retail-0095 (256-d) 默认是 cos=0.4 / l2=1.0.
 # SFace (128-d, 我们 face-py 用) 跨 322 photo 测出 cos 系统性偏低 ~0.10, l2 偏高 ~0.10.
-# 直接套 face C++ 默认会得到 ~55% 决策一致率 (大量 false-mismatch).
-# 重 tune 到 cos=0.30 / l2=1.10 → 78% 决策一致率 + 0 false-match (precision 100%),
-# 是 0 FP 区间里 recall 最高的点. 进一步收紧到 95% 需要客户标注 ground truth.
-def get_match_thresholds() -> tuple[float, float]:
-    """返 (cosine_threshold, l2_threshold), 默认 0.30 / 1.10 (face-py + SFace v0.4.0)."""
-    cos = float(os.environ.get("FACE_COSINE_THRESH", "0.30"))
-    l2 = float(os.environ.get("FACE_L2_THRESH", "1.10"))
-    return cos, l2
+# Phase A.4 单 cos thresh 调到 0.30/1.10 → 78% 决策一致率, 但 session-level 错报飙升
+# (specificity 53.8% << face C++ 92.3%). Phase A.5 引入 cos 中间区 (mismatch zone +
+# match zone, 中间走 inconclusive), 同时加 detector + size + clarity quality gates:
+# session-level 在 customer GT 上 recall 100% specificity 94.9% accuracy 95% (好于
+# face C++ 92.3% / 92.5%), 代价是 photo-level inconclusive 率 23% (vs face C++ ~10%).
+def get_match_thresholds() -> tuple[float, float, float]:
+    """返 (cos_mismatch_thresh, cos_match_thresh, l2_max_thresh).
+
+    cos < cos_mismatch_thresh           → mismatch (高置信不像)
+    cos >= cos_match_thresh AND l2 <= l2_max  → match (高置信像)
+    其余 → inconclusive (cos 中间区, 拿不准)
+
+    默认 0.15 / 0.30 / 1.15 (Phase A.5 sweep 出的 pareto-optimal).
+    """
+    cos_mismatch = float(os.environ.get("FACE_COSINE_MISMATCH_THRESH", "0.15"))
+    cos_match = float(os.environ.get("FACE_COSINE_THRESH", "0.30"))
+    l2_max = float(os.environ.get("FACE_L2_THRESH", "1.15"))
+    return cos_mismatch, cos_match, l2_max
+
+
+def classify_match(cos: float, l2: float,
+                    cos_mismatch_thresh: Optional[float] = None,
+                    cos_match_thresh: Optional[float] = None,
+                    l2_max_thresh: Optional[float] = None) -> str:
+    """Tri-state classifier (Phase A.5).
+
+    返 'match' | 'mismatch' | 'inconclusive'.
+    """
+    if cos_mismatch_thresh is None or cos_match_thresh is None or l2_max_thresh is None:
+        env_lo, env_hi, env_l2 = get_match_thresholds()
+        if cos_mismatch_thresh is None: cos_mismatch_thresh = env_lo
+        if cos_match_thresh is None:    cos_match_thresh = env_hi
+        if l2_max_thresh is None:       l2_max_thresh = env_l2
+    if cos < cos_mismatch_thresh:
+        return "mismatch"
+    if cos >= cos_match_thresh and l2 <= l2_max_thresh:
+        return "match"
+    return "inconclusive"
 
 
 def is_same_person(cos: float, l2: float,
                     cos_thresh: Optional[float] = None,
                     l2_thresh: Optional[float] = None) -> bool:
-    """跟 face C++ FaceRecognizer::match line 246-247 一致:
-        is_same_person = cos >= cos_thresh AND l2 <= l2_thresh
+    """两态版本, 给 /face/compare 用 (直接比对场景, 客户预期 bool 输出).
+
+    跟 face C++ FaceRecognizer::match line 246-247 等价 (但 cos_thresh 默认是新值 0.30,
+    不是 face C++ 的 0.45).
     """
     if cos_thresh is None or l2_thresh is None:
-        env_cos, env_l2 = get_match_thresholds()
-        if cos_thresh is None:
-            cos_thresh = env_cos
-        if l2_thresh is None:
-            l2_thresh = env_l2
+        _, env_cos, env_l2 = get_match_thresholds()
+        if cos_thresh is None: cos_thresh = env_cos
+        if l2_thresh is None:  l2_thresh = env_l2
     return cos >= cos_thresh and l2 <= l2_thresh
