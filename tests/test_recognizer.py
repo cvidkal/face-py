@@ -37,25 +37,34 @@ class CosineL2Test(unittest.TestCase):
 
 
 class IsSamePersonTest(unittest.TestCase):
+    """注: v0.4.0 默认阈值是 cos=0.30 / l2=1.10 (Phase A.4 重 tune 后), 不是
+    face C++ 的 0.40 / 1.0. 见 docs/cross_validation_v0_4_0.md.
+    """
 
     def setUp(self) -> None:
         for k in ("FACE_COSINE_THRESH", "FACE_L2_THRESH"):
             os.environ.pop(k, None)
 
+    def test_default_thresholds(self) -> None:
+        cos_t, l2_t = get_match_thresholds()
+        self.assertAlmostEqual(cos_t, 0.30)
+        self.assertAlmostEqual(l2_t, 1.10)
+
     def test_high_cos_low_l2_match(self) -> None:
-        # cos=0.55, l2=0.9 — 远高于 0.4, 远低于 1.0
+        # cos=0.55, l2=0.9 — 远高于 0.30, 远低于 1.10
         self.assertTrue(is_same_person(0.55, 0.9))
 
     def test_low_cos_no_match(self) -> None:
-        self.assertFalse(is_same_person(0.35, 0.9))
+        # cos=0.25 < 0.30
+        self.assertFalse(is_same_person(0.25, 0.9))
 
     def test_high_l2_no_match(self) -> None:
         # 即便 cos 高, l2 越线就 mismatch (跟 face C++ AND 关系)
-        self.assertFalse(is_same_person(0.55, 1.05))
+        self.assertFalse(is_same_person(0.55, 1.15))
 
     def test_boundary_at_threshold(self) -> None:
-        # cos 恰等于 0.4 应该 match (>=), l2 恰等于 1.0 应该 match (<=)
-        self.assertTrue(is_same_person(0.4, 1.0))
+        # cos 恰等于 0.30 应该 match (>=), l2 恰等于 1.10 应该 match (<=)
+        self.assertTrue(is_same_person(0.30, 1.10))
 
     def test_explicit_threshold_override(self) -> None:
         # 提高 cos 阈值到 0.6, 同 cos 0.55 变 mismatch
@@ -66,7 +75,7 @@ class IsSamePersonTest(unittest.TestCase):
         try:
             cos_t, l2_t = get_match_thresholds()
             self.assertAlmostEqual(cos_t, 0.5)
-            self.assertAlmostEqual(l2_t, 1.0)
+            self.assertAlmostEqual(l2_t, 1.10)
             self.assertFalse(is_same_person(0.45, 0.9))
             self.assertTrue(is_same_person(0.55, 0.9))
         finally:

@@ -76,8 +76,13 @@
 - `image_read_failed` / `ref_image_read_failed` — opencv 读图失败 (此分支带 clarity_score)
 - `feature_extraction_failed` — embedding 抽取异常 (此分支带 clarity_score)
 
-`match_status` ∈ `{match, mismatch, inconclusive}`. 阈值 `FACE_COSINE_THRESH` (默认 0.4) +
-`FACE_COSINE_INCONCLUSIVE_THRESH` (默认 0.3, face#13 中间区) — **未来 v0.4.0 重测后会重 tune**.
+`match_status` ∈ `{match, mismatch, inconclusive}`. 阈值 `FACE_COSINE_THRESH` (默认
+**0.30**, Phase A.4 重 tune 后, 见 docs/cross_validation_v0_4_0.md) + `FACE_L2_THRESH`
+(默认 **1.10**) — 注意跟 face C++ 默认 0.4/1.0 **不一样**, 因 SFace 跟
+face-reidentification-retail-0095 cos 分布偏移 ~ -0.10.
+
+切到 face-py 时 TA 端 `FACE_COSINE_THRESH` env **必须同步切**, 否则带 face C++ 的
+0.4 阈值打 face-py 会得到 55% 决策一致率 (Phase A.4 实测).
 
 ### `POST /api/v1/face/compare`
 
@@ -105,8 +110,9 @@
 | `FACE_HTTP_PORT` | 32192 | face C++ 占 32186, face-py 走 32192 |
 | `FACE_HTTP_AUTH_TOKEN` | (empty) | 配了就启 auth, 跟 face C++ 同协议 (Bearer / X-API-Key) |
 | `FACE_HTTP_AUTH_REQUIRED` | auto | 跟 `auth_token` 非空联动 |
-| `FACE_COSINE_THRESH` | 0.4 | match 阈值, 跟 face C++ 同名 |
-| `FACE_COSINE_INCONCLUSIVE_THRESH` | 0.3 | inconclusive 中间区下界, face#13 patch 后约定 |
+| `FACE_COSINE_THRESH` | **0.30** | match 阈值. **跟 face C++ 默认 0.4 不一样** (Phase A.4 重 tune) |
+| `FACE_L2_THRESH` | **1.10** | match l2 阈值. 同上 |
+| `FACE_COSINE_INCONCLUSIVE_THRESH` | 0.20 | inconclusive 中间区下界, face#13 中间区相对 cos 阈值 - 0.1 |
 | `FACE_DETECT_MODEL_PATH` | models/face_detection_yunet_2023mar.onnx | YuNet |
 | `FACE_RECOGNIZE_MODEL_PATH` | models/face_recognition_sface_2021dec.onnx | SFace |
 | `FACE_DEVICE` | cuda | "cuda" / "cpu". cuda 走 CUDAExecutionProvider, 没卡时 fallback cpu |

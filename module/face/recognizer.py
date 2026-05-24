@@ -93,15 +93,18 @@ def l2_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
 
 
-# 业务阈值, 跟 face C++ 同名同默认 (但因为换了模型, 实际 v0.4.0 会重 tune).
+# 业务阈值, 用 ENV 覆盖. 默认值来自 Phase A.4 cross-validation 跟 face C++ baseline
+# 重 tune (docs/cross_validation_v0_4_0.md).
+#
+# face C++ 用 face-reidentification-retail-0095 (256-d) 默认是 cos=0.4 / l2=1.0.
+# SFace (128-d, 我们 face-py 用) 跨 322 photo 测出 cos 系统性偏低 ~0.10, l2 偏高 ~0.10.
+# 直接套 face C++ 默认会得到 ~55% 决策一致率 (大量 false-mismatch).
+# 重 tune 到 cos=0.30 / l2=1.10 → 78% 决策一致率 + 0 false-match (precision 100%),
+# 是 0 FP 区间里 recall 最高的点. 进一步收紧到 95% 需要客户标注 ground truth.
 def get_match_thresholds() -> tuple[float, float]:
-    """返 (cosine_threshold, l2_threshold). 默认 0.4 / 1.0 跟 face C++ 一致.
-
-    SFace 跟 face-reidentification-retail-0095 是不同模型, cos 分布**大概率**不一样,
-    Phase A.4 重测后这俩默认值要重选. 当前先放 face C++ 默认占位.
-    """
-    cos = float(os.environ.get("FACE_COSINE_THRESH", "0.4"))
-    l2 = float(os.environ.get("FACE_L2_THRESH", "1.0"))
+    """返 (cosine_threshold, l2_threshold), 默认 0.30 / 1.10 (face-py + SFace v0.4.0)."""
+    cos = float(os.environ.get("FACE_COSINE_THRESH", "0.30"))
+    l2 = float(os.environ.get("FACE_L2_THRESH", "1.10"))
     return cos, l2
 
 
