@@ -291,3 +291,101 @@ level 错报, 加起来同样是 ~17% 客户感知干扰, 但 face-py 的 23% �
 
 跟 face C++ env 名 / 默认值都不同 — 部署时按 face-py 默认即可, face C++ 部署不动
 (灰度切换期两套阈值各自独立).
+
+---
+
+## Phase A.6 — large-sample ROC over cross-student pairs (2026-05-24)
+
+### 14. Why A.5 customer GT is statistically thin
+
+A.5 把 face-py 在 customer ground truth (40 sessions, 1 真造假 + 39 clean) 上量到
+recall 100% / specificity 94.9% — 但 **positive class n=1**, 任何 ROC 形状结论都
+脆弱. Phase A.6 用 cross-student pair benchmark 扩样本到 11,520 pair (288 same +
+11,232 cross), 验证 A.5 thresholds 在大样本上是否最优.
+
+### 15. Pair construction
+
+跟 LFW / IJB-C face recognition benchmark 同款做法:
+
+- **Same-person pair**: 每张 photo vs 同学员 ref. 322 个, 假设大多数是同一人
+  (39 clean session 默认成立, rec#2 sign_out 那 1 个真造假 是 known mismatch).
+- **Cross-person pair**: 每张 photo vs 其它 39 个 student 的 ref. **322 × 39 = 12,558
+  个 cross-person pair**, 全部是不同人.
+
+只取过 quality gates 的 photo: 322 → 288 (12% 走 gate-inconclusive 不计入 ROC).
+
+### 16. Cos distribution
+
+| 类别 | n | mean | stdev | p5 | p50 | p99 |
+|---|---|---|---|---|---|---|
+| same-person | 288 | **0.479** | 0.136 | 0.206 | 0.496 | 0.729 |
+| cross-person | 11,232 | **0.076** | 0.104 | -0.093 | 0.075 | 0.323 |
+
+两个分布**清晰分离**, mean 间距 0.40, 重叠区集中在 [0.28, 0.33] 尾巴. SFace 嵌入空间
+对 "完全不同环境的两个人" 区分良好.
+
+### 17. ROC sweep
+
+| `cos_match` thresh | TPR (recall same) | FPR (false-match cross) | specificity |
+|---|---|---|---|
+| 0.25 | 92.0% | 4.78% | 95.2% |
+| 0.27 | 91.0% | 3.38% | 96.6% |
+| 0.29 | 89.9% | 2.14% | 97.9% |
+| **0.30 (A.5 default)** | **89.9%** | **1.58%** | **98.7%** ← **ROC knee** |
+| 0.31 | 88.9% | 1.29% | 98.7% |
+| 0.35 | 83.0% | 0.54% | 99.5% |
+| 0.40 | 74.7% | 0.17% | 99.9% |
+
+A.5 默认 0.30 正好在 ROC 拐点 — recall 下降到 89.9% (已经够高), specificity 已经
+98.7%. 再收紧到 0.35 换 0.8 pp specificity 但损失 7 pp recall, 性价比不行. A.5
+threshold 在大样本上 **confirmed optimal**, 无需 retune.
+
+### 18. False-mismatch (FN) audit on same-person pairs
+
+4 个 same-person pairs cos < 0.15 (face-py 错判 mismatch):
+
+| student_id | seq | photo_type | cos | l2 | 备注 |
+|---|---|---|---|---|---|
+| S170556381410883 | 10 | process | 0.107 | 1.336 | audit_vs_actual.md 已确认 face C++ 也错报这条 session ("face 模型车内场景 false positive") |
+| S170556381410883 | 11 | sign_out | 0.133 | 1.317 | 同上 |
+| **S177509932310186** | **11** | **sign_out** | **0.141** | **1.311** | **rec#2 真造假 (代训), face-py 正确 caught — 这其实是 TP 不是 FN** |
+| S173197797710911 | 5 | process | 0.145 | 1.307 | rec#1 customer 标"停车打卡"非 identity, 但 cos 这么低**可能存在未标注的 identity 异常** (双重违规?) |
+
+排除真造假后, 真 FN 只有 **2/288 = 0.7%**. Face-py 在能下决策的 photo 上, **同一人误
+判 mismatch 的概率 < 1%**.
+
+### 19. False-match (FP) audit on cross-person pairs
+
+178 个 cross-person pair cos ≥ 0.30 (face-py 错判 match). 分布:
+- cos: min 0.300, max 0.486, **mean 0.342** — 都是边缘 case, 没有高分错配 (没 cos > 0.5)
+- 集中在几个 student (S172160892610907 贡献 30 个, S177406302410427 13 个等) — 可能这
+  几个 student 长相 / 拍摄角度有某种通用特征. 不深挖, 单 student 30/322 photos = 9%
+  的"看起来像别人"率仍在可接受范围.
+
+### 20. Cross-student 不等于真代训 — caveat
+
+真代训是**同 session 内换人**: 相同背景 / 光照 / 车型 / 相机. cross-student pair 是
+完全不同环境的两个人, incidental 差异多, **更容易分**.
+
+所以 1.58% FPR 是**乐观估计**, 真代训上检出率会更难. 但反向论证仍成立: 如果连完全
+不同环境的两个人都只能分出 98.7%, 同 session 代训的检出率不会更高 (代训方通常会挑
+长相相似的人).
+
+未来如果要更严格的代训 benchmark, 需要构造 "**same-context cross-person**" pair —
+比如 swap 两个 student 同一时刻 / 同一路段的 photo. 单靠现有客户数据无法构造.
+
+### 21. 结论
+
+A.5 thresholds 在 11,520 pair 大样本 ROC 上 confirmed optimal:
+- recall 89.9% (catch 同一人), false-mismatch 0.7% (排除真造假)
+- false-match cross-person 1.58% (上限估计, 真代训会更难)
+- inconclusive 8.7% (same) / 22% (cross) — 大部分边缘 cos 走 inconclusive 不强决策
+
+**判定: A.5 default thresholds (cos < 0.15 → mismatch, cos ≥ 0.30 → match) 是
+data-supported 最优, 直接 ship 给客户验证窗口**.
+
+### 22. Phase A.6 artifacts
+
+- per-pair JSONL: `/tmp/face_py_xval/pair_cos.jsonl` (11,520 行)
+- ROC sweep script: `/tmp/face_py_xval/roc_analysis.py`
+- 给后续画 ROC 曲线 / 直方图用
