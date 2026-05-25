@@ -36,3 +36,7 @@ data/
 
 # ORT C++ release artifacts (downloaded by setup script, not committed)
 .deps/
+
+# Local deployment env files (have secrets). Modeled after .env.example templates.
+deploy/env/dev.env
+deploy/env/prod.env

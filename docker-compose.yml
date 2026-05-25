@@ -1,0 +1,47 @@
+# face-py 本机部署 (dev + prod 同一 compose 文件管).
+#
+# 跟 sibling 容器 (face / cloth / day_night / dup_detect) 同款约定:
+#   network_mode: host  — 端口直接绑主机, 不走 docker NAT, 服务间互调走 loopback
+#   runtime: nvidia     — 需要 GPU, ORT-CUDA 走 nvidia container runtime
+#   restart: unless-stopped — prod 长跑; dev on-failure 不阻挡手动停
+#
+# 用法:
+#   sudo docker compose up -d face-py-dev     # 起 dev (port 33293)
+#   sudo docker compose up -d face-py-prod    # 起 prod (port 32192)
+#   sudo docker compose logs -f face-py-dev   # 看日志
+#   sudo docker compose restart face-py-dev   # 改代码后 rebuild + 重启
+#
+# env 来自 deploy/env/{dev,prod}.env (gitignored, 拷自 .env.example 模板再填密码).
+
+services:
+  face-py-dev:
+    image: face-py:latest
+    container_name: face-py-dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+    runtime: nvidia
+    network_mode: host
+    restart: on-failure:3
+    env_file:
+      - deploy/env/dev.env
+    volumes:
+      # 模型文件 — 不打镜像 (大且 gitignored)
+      - ./models:/app/models:ro
+      # 客户图像数据 — 跟 face C++ 容器同款挂载点, TA 发的绝对路径在容器内可读
+      - /var/lib/training_analyzer/sessions:/var/lib/training_analyzer/sessions:ro
+
+  face-py-prod:
+    image: face-py:latest
+    container_name: face-py-prod
+    build:
+      context: .
+      dockerfile: Dockerfile
+    runtime: nvidia
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - deploy/env/prod.env
+    volumes:
+      - ./models:/app/models:ro
+      - /var/lib/training_analyzer/sessions:/var/lib/training_analyzer/sessions:ro
