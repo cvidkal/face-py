@@ -37,6 +37,7 @@ from .recognizer import (
     FaceRecognizer, classify_match, cosine_score, get_match_thresholds,
     is_same_person, l2_distance,
 )
+from .session_consistency import check_internal_consistency, session_prototype
 
 
 log = logging.getLogger("face-py.pipeline")
@@ -69,6 +70,75 @@ class IdentityCheckResult:
             "match_status": self.match_status,
             "error_code": self.error_code,
             "error": self.error,
+            "elapsed_ms": round(self.elapsed_ms, 3),
+        }
+
+
+@dataclass
+class SessionPhotoResult:
+    """Per-photo slot inside SessionCheckResult.photo_results."""
+    sequence_no: int = 0
+    photo_type: str = ""
+    face_count: int = 0
+    passes_gate: bool = False
+    cosine_score: Optional[float] = None       # vs ref, only post-gate
+    l2_distance: Optional[float] = None
+    clarity_score: Optional[float] = None
+    match_status: str = "inconclusive"          # per-photo, A.5 tri-state
+    error_code: str = ""
+    error: str = ""
+    is_outlier: bool = False                    # Stage 1 flag
+    mean_cos_to_peers: Optional[float] = None   # Stage 1 signal
+
+    def to_json(self) -> dict:
+        return {
+            "sequence_no": self.sequence_no,
+            "photo_type": self.photo_type,
+            "face_count": self.face_count,
+            "passes_gate": self.passes_gate,
+            "cosine_score": self.cosine_score,
+            "l2_distance": self.l2_distance,
+            "clarity_score": self.clarity_score,
+            "match_status": self.match_status,
+            "error_code": self.error_code,
+            "error": self.error,
+            "is_outlier": self.is_outlier,
+            "mean_cos_to_peers": self.mean_cos_to_peers,
+        }
+
+
+@dataclass
+class SessionCheckResult:
+    """Phase A.7 — two-stage session-level identity verification.
+
+    Stage 1 (internal_consistency): pairwise cos among post-gate photos.
+    Stage 2 (session_cos_to_ref / session_l2_to_ref): prototype vs ref.
+
+    session_status = "match" / "mismatch" / "inconclusive" — the single
+    authoritative session-level decision the orchestrator should consume.
+    """
+    session_status: str = "inconclusive"
+    internal_consistency: str = "unknown"   # consistent / inconsistent / single / unknown
+    outlier_sequence_nos: list[int] = field(default_factory=list)
+    session_cos_to_ref: Optional[float] = None
+    session_l2_to_ref: Optional[float] = None
+    n_photos: int = 0
+    n_post_gate: int = 0
+    reason: str = ""
+    photo_results: list[SessionPhotoResult] = field(default_factory=list)
+    elapsed_ms: float = 0.0
+
+    def to_json(self) -> dict:
+        return {
+            "session_status": self.session_status,
+            "internal_consistency": self.internal_consistency,
+            "outlier_sequence_nos": self.outlier_sequence_nos,
+            "session_cos_to_ref": self.session_cos_to_ref,
+            "session_l2_to_ref": self.session_l2_to_ref,
+            "n_photos": self.n_photos,
+            "n_post_gate": self.n_post_gate,
+            "reason": self.reason,
+            "photo_results": [p.to_json() for p in self.photo_results],
             "elapsed_ms": round(self.elapsed_ms, 3),
         }
 
@@ -294,6 +364,215 @@ class FacePipeline:
             result.error_code = FEATURE_EXTRACTION_FAILED
             result.error = str(exc)
             return self._finish(result, t0)
+
+    # ----- session_check (Phase A.7 two-stage) -----
+
+    def session_check(self, ref_image_path: str,
+                       photos: list[dict]) -> "SessionCheckResult":
+        """Two-stage session-level identity verification.
+
+        photos: list of dicts with keys 'sequence_no', 'photo_type', 'image_path'.
+
+        Stage 1 — internal consistency: pairwise cos among post-gate photo
+        embeddings. Any photo whose mean cos to peers < threshold = outlier;
+        any outlier → session is 'inconsistent' → session_status='mismatch'
+        (代训信号), regardless of Stage 2.
+
+        Stage 2 — prototype vs ref: only the consistent core's mean embedding
+        (L2-normalized) is compared to ref, then classified with A.5 tri-state
+        thresholds. Single post-gate photo: skip Stage 1, run Stage 2 directly
+        on that one embedding. Zero post-gate photos: inconclusive.
+
+        Outlier session also reports session_cos_to_ref of the majority core
+        (excluding outliers) as a diagnostic — does not change session_status.
+        """
+        result = SessionCheckResult()
+        result.n_photos = len(photos)
+        t0 = time.perf_counter()
+
+        try:
+            # ----- 1. Resolve ref embedding (via cache) -----
+            cache_key = RefFeatureCache.make_key(ref_image_path)
+            emb_ref = self.ref_cache.get(cache_key) if cache_key else None
+            if emb_ref is None:
+                ref_img = cv2.imread(ref_image_path)
+                if ref_img is None or ref_img.size == 0:
+                    result.session_status = "inconclusive"
+                    result.reason = msg_ref_image_read_failed(ref_image_path)
+                    return self._finish_session(result, t0)
+                try:
+                    ref_faces = self.detector.detect(ref_img)
+                    ref_primary = largest_face(ref_faces)
+                    if ref_primary is None:
+                        raise RuntimeError("No face detected in reference image")
+                    ref_aligned = self.aligner.align(ref_img, ref_primary)
+                    emb_ref = self.recognizer.extract(ref_aligned)
+                except Exception as exc:
+                    result.session_status = "inconclusive"
+                    result.reason = f"ref extraction failed: {exc}"
+                    return self._finish_session(result, t0)
+                if cache_key:
+                    self.ref_cache.put(cache_key, emb_ref)
+
+            # ----- 2. Per-photo: detect + gate + extract -----
+            embeddings: list[np.ndarray] = []          # post-gate only
+            emb_to_photo_idx: list[int] = []           # parallel to embeddings
+            for p in photos:
+                pr = self._process_photo_for_session(p)
+                # Compute per-photo cos vs ref now (cheap), regardless of gate —
+                # gives clients diagnostic info even on gate-failed photos.
+                if pr.passes_gate:
+                    # We need the embedding again to compare to ref. Re-extract is
+                    # wasteful; instead _process_photo_for_session can return
+                    # embedding too. We stuff it in a private attr.
+                    emb = getattr(pr, "_embedding", None)
+                    if emb is not None:
+                        cos_v = cosine_score(emb, emb_ref)
+                        l2_v = float(l2_distance(emb, emb_ref))
+                        pr.cosine_score = cos_v
+                        pr.l2_distance = l2_v
+                        pr.match_status = classify_match(cos_v, l2_v)
+                        embeddings.append(emb)
+                        emb_to_photo_idx.append(len(result.photo_results))
+                # Drop the private attr before serialization
+                if hasattr(pr, "_embedding"):
+                    delattr(pr, "_embedding")
+                result.photo_results.append(pr)
+
+            result.n_post_gate = len(embeddings)
+
+            # ----- 3. Stage 1 + Stage 2 decision -----
+            if result.n_post_gate == 0:
+                result.session_status = "inconclusive"
+                result.internal_consistency = "unknown"
+                result.reason = "no post-gate photos"
+                return self._finish_session(result, t0)
+
+            if result.n_post_gate == 1:
+                # Skip Stage 1, run Stage 2 on single photo
+                emb = embeddings[0]
+                cos_v = cosine_score(emb, emb_ref)
+                l2_v = float(l2_distance(emb, emb_ref))
+                result.session_cos_to_ref = cos_v
+                result.session_l2_to_ref = l2_v
+                result.session_status = classify_match(cos_v, l2_v)
+                result.internal_consistency = "single"
+                result.reason = (f"single post-gate photo, "
+                                  f"cos={cos_v:.3f} l2={l2_v:.3f}")
+                return self._finish_session(result, t0)
+
+            # Stage 1
+            consistency = check_internal_consistency(embeddings)
+            for emb_idx, photo_idx in enumerate(emb_to_photo_idx):
+                result.photo_results[photo_idx].mean_cos_to_peers = round(
+                    consistency.mean_cos_per_index[emb_idx], 4)
+                if emb_idx in consistency.outlier_indices:
+                    result.photo_results[photo_idx].is_outlier = True
+                    result.outlier_sequence_nos.append(
+                        result.photo_results[photo_idx].sequence_no)
+
+            if not consistency.is_consistent:
+                # 内部不一致 → 代训
+                result.internal_consistency = "inconsistent"
+                # diagnostic: prototype of majority core vs ref
+                core = [embeddings[i] for i in range(len(embeddings))
+                         if i not in consistency.outlier_indices]
+                if core:
+                    proto = session_prototype(core)
+                    result.session_cos_to_ref = cosine_score(proto, emb_ref)
+                    result.session_l2_to_ref = float(l2_distance(proto, emb_ref))
+                result.session_status = "mismatch"
+                result.reason = (f"Stage 1: {len(consistency.outlier_indices)} outlier(s) "
+                                  f"mean_cos<{consistency.threshold}")
+                return self._finish_session(result, t0)
+
+            # Stage 2 — prototype of all post-gate photos vs ref
+            result.internal_consistency = "consistent"
+            proto = session_prototype(embeddings)
+            cos_v = cosine_score(proto, emb_ref)
+            l2_v = float(l2_distance(proto, emb_ref))
+            result.session_cos_to_ref = cos_v
+            result.session_l2_to_ref = l2_v
+            result.session_status = classify_match(cos_v, l2_v)
+            result.reason = (f"Stage 2: prototype cos={cos_v:.3f} l2={l2_v:.3f}")
+            return self._finish_session(result, t0)
+
+        except Exception as exc:
+            result.session_status = "inconclusive"
+            result.reason = f"unexpected error: {exc}"
+            return self._finish_session(result, t0)
+
+    def _process_photo_for_session(self, p: dict) -> "SessionPhotoResult":
+        """Run gates + (if passing) extract embedding for one photo.
+
+        Returns SessionPhotoResult with passes_gate / error_code set. If gate
+        passes, attaches embedding as private attr _embedding for caller use.
+        Caller is responsible for cos/l2 vs ref + setting match_status / cleanup.
+        """
+        pr = SessionPhotoResult(
+            sequence_no=int(p.get("sequence_no", 0)),
+            photo_type=str(p.get("photo_type", "")),
+        )
+        image_path = str(p.get("image_path", ""))
+        if not image_path:
+            pr.error_code = IMAGE_READ_FAILED
+            pr.error = "image_path is empty"
+            return pr
+        image = cv2.imread(image_path)
+        if image is None or image.size == 0:
+            pr.error_code = IMAGE_READ_FAILED
+            pr.error = msg_image_read_failed(image_path)
+            return pr
+        faces = self.detector.detect(image)
+        pr.face_count = len(faces)
+        primary = largest_face(faces)
+        if primary is None:
+            pr.error_code = NO_FACE
+            pr.error = MSG_NO_FACE
+            return pr
+        gate = self.quality
+        if primary.score < gate.det_score_min:
+            pr.error_code = DETECTION_LOW_CONFIDENCE
+            pr.error = msg_detection_low_confidence(primary.score, gate.det_score_min)
+            return pr
+        bbox_min_side = min(primary.bbox_xywh[2], primary.bbox_xywh[3])
+        if bbox_min_side < gate.face_bbox_min_px:
+            pr.error_code = FACE_TOO_SMALL
+            pr.error = msg_face_too_small(bbox_min_side, gate.face_bbox_min_px)
+            return pr
+        pose = compute_head_pose(primary.landmarks)
+        if (abs(pose.yaw_ratio) > gate.yaw_max
+                or abs(pose.pitch_ratio) > gate.pitch_max):
+            pr.error_code = POSE_EXCESSIVE
+            pr.error = msg_pose_excessive(pose.yaw_ratio, pose.pitch_ratio)
+            return pr
+        try:
+            aligned = self.aligner.align(image, primary)
+        except Exception as exc:
+            pr.error_code = FEATURE_EXTRACTION_FAILED
+            pr.error = str(exc)
+            return pr
+        clarity = compute_image_clarity_score(aligned)
+        pr.clarity_score = float(clarity) if clarity is not None else None
+        if clarity is None or clarity < gate.face_crop_clarity_min:
+            pr.error_code = FACE_TOO_BLURRY
+            pr.error = msg_face_too_blurry(clarity or 0.0, gate.face_crop_clarity_min)
+            return pr
+        try:
+            emb = self.recognizer.extract(aligned)
+        except Exception as exc:
+            pr.error_code = FEATURE_EXTRACTION_FAILED
+            pr.error = str(exc)
+            return pr
+        pr.passes_gate = True
+        # Attach embedding for caller — stripped before serialization
+        pr._embedding = emb  # type: ignore[attr-defined]
+        return pr
+
+    @staticmethod
+    def _finish_session(result: "SessionCheckResult", t0: float) -> "SessionCheckResult":
+        result.elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return result
 
     # ----- compare (两张图直接比, 无 ref cache, 无 pose gate) -----
 

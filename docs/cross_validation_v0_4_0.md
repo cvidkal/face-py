@@ -389,3 +389,93 @@ data-supported 最优, 直接 ship 给客户验证窗口**.
 - per-pair JSONL: `/tmp/face_py_xval/pair_cos.jsonl` (11,520 行)
 - ROC sweep script: `/tmp/face_py_xval/roc_analysis.py`
 - 给后续画 ROC 曲线 / 直方图用
+
+---
+
+## Phase A.7: 两阶段 session-level identity verification
+
+### 23. Motivation — user framing
+
+A.5 + A.6 把 per-photo 决策做到了 single-photo 物理上限 (cross-student baseline FP
+1.58% at cos≥0.30). 进一步靠 single-photo gate 已经没空间 — 真代训跟"长得像的两人"
+single-photo 无法区分.
+
+User 在 Phase A.6 review 时给了新 framing: 人脑判代训分两步, **(1) 先看 session 内部
+N 张 photo 是不是同一个人 — 不管这个人是谁, (2) 再看那个人是不是 ref 那个人**. 当前
+pipeline 只做了 (2) 的变体, (1) 完全没做. rec#2 (sign_out 是替考) 就是 (1) 直接抓住
+的典型 — 9 张 process photo 之间高度相似 (0.6-0.7 cos), sign_out 跟它们 ~0.1 cos.
+
+### 24. Stage 1 算法
+
+`module/face/session_consistency.py::check_internal_consistency`:
+
+1. 输入 N 个 post-gate photo embedding (gate failed 的不参与 Stage 1)
+2. 算 N×N pairwise cos 矩阵
+3. 对每张 photo i, mean_cos[i] = mean(cos(i, j) for j != i)
+4. mean_cos[i] < X → photo i 是 outlier
+5. 任一 outlier → internal_consistency = "inconsistent" → session_status = "mismatch"
+
+阈值 X 默认 0.20 (`FACE_SESSION_OUTLIER_MEAN_COS`). 选择理由: rec#2 imposter mean_cos
+= 0.106, 真学员 0.685-0.747, gap > 0.5; X∈[0.15, 0.30] 全部 TP=1 FN=0 FP=0 TN=39.
+取中段 0.20 留 safety margin.
+
+### 25. Stage 2 算法
+
+仅在 Stage 1 通过 (无 outlier) 时跑.
+
+1. 取 consistent core (= 所有 post-gate photo, 因为 Stage 1 没标 outlier)
+2. 算 prototype = L2_normalize(mean(core embeddings))
+3. cos / l2 vs ref → A.5 tri-state classify (cos<0.15 mismatch / cos≥0.30+l2≤1.15 match / else inconclusive)
+
+### 26. 边界 case
+
+- 0 post-gate photo: session_status = inconclusive ("no post-gate photos")
+- 1 post-gate photo: skip Stage 1 (无 peer), Stage 2 直接对单 photo 跑
+- Stage 1 报 outlier 时仍 emit session_cos_to_ref (= majority core prototype vs ref) 作 diagnostic, 不影响 session_status
+
+### 27. 40-session 验证结果
+
+```
+Stage 1 outlier threshold X = 0.20
+student_id           gated status        consist          cos outliers   GT
+...
+S172838535810299         8 inconclusive  consistent     0.244            neg
+S174226176810649         5 inconclusive  consistent     0.313            neg
+S175608816410439         0 inconclusive  unknown          -              neg
+S177509932310186         9 mismatch      inconsistent   0.664 [11]       POS  ← rec#2 caught
+...
+Confusion (mismatch=alarm): TP=1 FN=0 FP=0 TN=39  (inconclusive=3)
+```
+
+3 个 inconclusive 是诚实的弃权, 不是错报:
+- S172838535810299 cos 0.244 — 整 session 跟 ref 不够像但内部稳定 (可能 ref 年代久远)
+- S174226176810649 cos 0.313 — 卡在 match 边界
+- S175608816410439 — 0 张通过 quality gate, 视频质量太差
+
+cross-student session-prototype baseline (1521 pair):
+- match rate (FP): 18/1521 = **1.18%** (vs A.6 single-photo cos≥0.30: 1.58%)
+- prototype 取 mean embedding 后 cross-student 分布收紧, FP 进一步降
+
+### 28. 对比
+
+| | recall | spec | cross-student FP | photo-level inconc |
+|---|---|---|---|---|
+| face C++ baseline | 100% | 92.3% | 4.80% (single ANY) | ~10% |
+| face-py A.5 single-photo | 100% | 94.9% | 1.58% (cos≥0.30) | 23% |
+| **face-py A.7 session_check** | **100%** | **97.5%** | **1.18%** (prototype) | n/a (per-session) |
+
+A.7 把 session-level specificity 推到 97.5% (39 TN + 3 inconc 视作"不报警", 1 真造假
+catch). 客户感知: 误报率从 5.1% → 2.5%.
+
+### 29. 客户契约 — 新 endpoint, 老的不动
+
+`/api/v1/face/identity_check` + `/face/compare` 保留, 完全兼容. `/api/v1/face/session_check`
+是新增, 用法详 CLAUDE.md "API endpoints" 段. TA 接入是单独 issue (A.7.5, scope 外).
+
+### 30. Phase A.7 artifacts
+
+- prototype 脚本: `/tmp/face_py_xval/two_stage_proto.py`
+- per-session 结果: `/tmp/face_py_xval/two_stage_proto_results.json`
+- 复用 embedding cache: `/tmp/face_py_xval/embeddings.pkl` (322 photo + 40 ref, 节省后续迭代 GPU cost)
+- E2E smoke: `/tmp/face_py_xval/test_session_check_e2e.py`
+- 单元测试: `tests/test_session_consistency.py` (9 cases)

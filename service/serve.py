@@ -153,6 +153,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_identity_check(); return
         if self.path == "/api/v1/face/compare":
             self._handle_compare(); return
+        if self.path == "/api/v1/face/session_check":
+            self._handle_session_check(); return
         self._error(HTTPStatus.NOT_FOUND, f"unknown path: {self.path}")
 
     # ----- handlers -----
@@ -211,6 +213,39 @@ class Handler(BaseHTTPRequestHandler):
                          request_id, "invalid_request"); return
 
         result = self.pipeline.compare(image_a, image_b)
+        self._write_json(HTTPStatus.OK, result.to_json())
+
+    def _handle_session_check(self) -> None:
+        """Phase A.7 two-stage session-level identity verification.
+
+        Request:
+            { "ref_image_path": str,
+              "photos": [{"sequence_no": int, "photo_type": str,
+                          "image_path": str}, ...] }
+        Response: SessionCheckResult.to_json() — see pipeline.py.
+        """
+        request_id = ""
+        if not self._check_auth():
+            self._error(HTTPStatus.UNAUTHORIZED, "missing authentication token",
+                        error_code="unauthorized"); return
+        try:
+            body = self._read_json_body()
+        except ValueError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request"); return
+        request_id = str(body.get("request_id", "") or uuid.uuid4())
+
+        ref_image_path = str(body.get("ref_image_path", ""))
+        photos = body.get("photos")
+        if not ref_image_path:
+            self._error(HTTPStatus.BAD_REQUEST,
+                         "Field 'ref_image_path' required (non-empty string)",
+                         request_id, "invalid_request"); return
+        if not isinstance(photos, list) or not photos:
+            self._error(HTTPStatus.BAD_REQUEST,
+                         "Field 'photos' required (non-empty array)",
+                         request_id, "invalid_request"); return
+
+        result = self.pipeline.session_check(ref_image_path, photos)
         self._write_json(HTTPStatus.OK, result.to_json())
 
 

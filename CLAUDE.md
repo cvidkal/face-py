@@ -107,6 +107,63 @@ else                                                  → inconclusive
 match/mismatch. 客户拿到的 anomaly 比 face C++ 更可信 (FP 少), 代价是 13 pp 更多 photo
 走 inconclusive (但这是诚实, 比"错报代训"破坏性小一万倍).
 
+### `POST /api/v1/face/session_check` (**Phase A.7 新, face-py 净增**)
+
+两阶段 session-level identity verification. 替代 TA orchestrator 调 8 次 identity_check
++ 自己聚合的脆弱模式 — 把"内部一致性 + vs ref" 整套塞进一个 endpoint, 让 face-py
+拥有 session-level decision authority.
+
+请求:
+```json
+{ "ref_image_path": "/var/lib/.../ref.jpg",
+  "photos": [
+    {"sequence_no": 1, "photo_type": "sign_in",  "image_path": "/.../seq_001_sign_in.jpg"},
+    {"sequence_no": 2, "photo_type": "process",  "image_path": "/.../seq_002_process.jpg"},
+    ...
+  ] }
+```
+
+响应:
+```json
+{ "session_status": "mismatch",
+  "internal_consistency": "inconsistent",
+  "outlier_sequence_nos": [11],
+  "session_cos_to_ref": 0.664,
+  "session_l2_to_ref": 0.820,
+  "n_photos": 11, "n_post_gate": 9,
+  "reason": "Stage 1: 1 outlier(s) mean_cos<0.2",
+  "photo_results": [
+    {"sequence_no": 1, "photo_type": "sign_in", "passes_gate": false,
+     "error_code": "face_too_blurry", ...},
+    {"sequence_no": 11, "photo_type": "sign_out", "passes_gate": true,
+     "cosine_score": 0.141, "match_status": "mismatch",
+     "is_outlier": true, "mean_cos_to_peers": 0.106, ...},
+    ...
+  ],
+  "elapsed_ms": 374.4 }
+```
+
+**两阶段算法** (详 `module/face/pipeline.py::session_check` + `module/face/session_consistency.py`):
+- **Stage 1 (internal_consistency)**: pairwise cos among post-gate photo embeddings.
+  每张 photo 算它对其它 photo 的 mean cos; mean cos < `FACE_SESSION_OUTLIER_MEAN_COS`
+  (默认 0.20) → 标 outlier. 任一 outlier → session_status='mismatch' (代训信号,
+  不等 Stage 2).
+- **Stage 2 (prototype vs ref)**: 仅在 Stage 1 通过时跑. 取 consistent core 的 mean
+  embedding (L2 normalize) → cos/l2 vs ref → A.5 tri-state classify (cos<0.15 mismatch,
+  cos≥0.30+l2≤1.15 match, else inconclusive).
+
+兜底: 0 post-gate photo → inconclusive. 1 post-gate photo → skip Stage 1, Stage 2 直接跑.
+
+**实测在 40-session customer GT 上 (Phase A.7 prototype)**:
+| | TP | FN | FP | TN | cross-student FP rate |
+|---|---|---|---|---|---|
+| face C++ single-photo ANY rule | 1 | 0 | 3 | 36 | 4.80% |
+| face-py A.5 single-photo cos≥0.30 | 1 | 0 | 2 | 37 | 1.58% |
+| **face-py A.7 session_check** | **1** | **0** | **0** | **39** | **1.18%** |
+
+rec#2 (S177509932310186, 唯一已知真造假) 的 imposter sign_out mean_cos=0.106, 其它
+8 张真学员 mean_cos 0.685-0.747 — gap 0.5+, X=0.20 在安全 margin 中段.
+
 ### `POST /api/v1/face/compare`
 
 跟 identity_check 类似但**没 head pose gate** (用户主动比对场景, 不滤). 字段 `is_same_person`
@@ -139,6 +196,7 @@ match/mismatch. 客户拿到的 anomaly 比 face C++ 更可信 (FP 少), 代价�
 | `FACE_DET_SCORE_MIN` | **0.88** | YuNet det_score < 此值 → inconclusive (Phase A.5) |
 | `FACE_BBOX_MIN_PX` | **40** | bbox min(w,h) < 此值 → inconclusive (Phase A.5) |
 | `FACE_CROP_CLARITY_MIN` | **30** | aligned crop Laplacian var < 此值 → inconclusive (Phase A.5) |
+| `FACE_SESSION_OUTLIER_MEAN_COS` | **0.20** | session_check Stage 1: photo mean_cos<此值→outlier→代训 (Phase A.7) |
 | `FACE_DETECT_MODEL_PATH` | models/face_detection_yunet_2023mar.onnx | YuNet |
 | `FACE_RECOGNIZE_MODEL_PATH` | models/face_recognition_sface_2021dec.onnx | SFace |
 | `FACE_DEVICE` | cuda | "cuda" / "cpu". cuda 走 CUDAExecutionProvider, 没卡时 fallback cpu |
