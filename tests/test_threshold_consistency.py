@@ -59,8 +59,8 @@ class ThresholdDerivationTests(unittest.TestCase):
 
     def test_l2_derived_from_cos_when_unset(self) -> None:
         _, cos_match, l2_max = get_match_thresholds()
-        self.assertAlmostEqual(cos_match, 0.30)
-        self.assertAlmostEqual(l2_max, cos_to_l2(0.30), places=9)
+        self.assertAlmostEqual(cos_match, 0.35)   # issue #1: 默认 0.30 → 0.35
+        self.assertAlmostEqual(l2_max, cos_to_l2(cos_match), places=9)
 
     def test_changing_cos_thresh_now_takes_effect(self) -> None:
         """回归本 bug: 以前 cos 调到 0.30~0.339 之间完全没效果 (l2 更严)."""
@@ -108,7 +108,7 @@ class ThresholdDerivationTests(unittest.TestCase):
 
 
 class ClassifyTests(unittest.TestCase):
-    """默认阈值下, cos 恰好在 0.30~0.339 之间的照片现在能判 match 了."""
+    """cos 落在「旧 l2 死区」(cos_match ~ l2 隐含的 cos) 的照片现在能判 match."""
 
     def setUp(self) -> None:
         self._old = dict(os.environ)
@@ -120,12 +120,18 @@ class ClassifyTests(unittest.TestCase):
         os.environ.update(self._old)
 
     def test_cos_in_former_dead_zone_now_matches(self) -> None:
+        # 旧行为: cos>=0.30 却被 l2<=1.15 (隐含 cos>=0.3388) 挡在门外.
+        # 显式传 cos_match=0.30 复现当时的配置, 验证死区没了。
         for cos in (0.300, 0.315, 0.338):
             with self.subTest(cos=cos):
-                self.assertEqual(classify_match(cos, cos_to_l2(cos)), "match")
+                self.assertEqual(
+                    classify_match(cos, cos_to_l2(cos), cos_match_thresh=0.30,
+                                   l2_max_thresh=cos_to_l2(0.30)), "match")
 
     def test_below_cos_match_still_inconclusive(self) -> None:
-        self.assertEqual(classify_match(0.29, cos_to_l2(0.29)), "inconclusive")
+        _, cos_match, l2_max = get_match_thresholds()
+        self.assertEqual(
+            classify_match(cos_match - 0.01, cos_to_l2(cos_match - 0.01)), "inconclusive")
 
     def test_mismatch_zone_unchanged(self) -> None:
         self.assertEqual(classify_match(0.10, cos_to_l2(0.10)), "mismatch")
