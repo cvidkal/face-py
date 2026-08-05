@@ -35,6 +35,11 @@ class QualityGateConfig:
     # aligned 112×112 crop 的 Laplacian variance. < 30 是糊到看不清五官. 30 比较松,
     # customer 数据 p10 是 65 — 30 这个阈值仅 cut 真糊照, 不误伤一般 dashcam 质量.
     face_crop_clarity_min: float = 30.0
+    # 挖掉 OSD 带后中心区的 Laplacian variance 下限 — 低于它认为"整张图没内容"
+    # (全黑 / 过曝纯白 / 只拍到车窗). 10.0 是 2 万张真实归档照片扫参 + 逐张看图定的,
+    # 命中率 0.075%; 13~25 那一带还能看到人脸, 不能判. 详见 content_gate.py docstring.
+    # 设 0 关闭该 gate. **跟分辨率有关**, 换图源要重新标定.
+    photo_content_min: float = 10.0
     # head pose 阈值, 跟 face C++ #13 patch 后默认一致. 这俩在 pose_gate.py 也读
     # FACE_POSE_ABS_YAW / FACE_POSE_ABS_PITCH env, 跟这俩字段联动.
     yaw_max: float = 0.35
@@ -46,6 +51,7 @@ class QualityGateConfig:
             det_score_min=float(os.environ.get("FACE_DET_SCORE_MIN", "0.88")),
             face_bbox_min_px=float(os.environ.get("FACE_BBOX_MIN_PX", "40")),
             face_crop_clarity_min=float(os.environ.get("FACE_CROP_CLARITY_MIN", "30")),
+            photo_content_min=float(os.environ.get("FACE_PHOTO_CONTENT_MIN", "10")),
             yaw_max=float(os.environ.get("FACE_POSE_ABS_YAW", "0.35")),
             pitch_max=float(os.environ.get("FACE_POSE_ABS_PITCH", "0.55")),
         )

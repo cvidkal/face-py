@@ -65,11 +65,16 @@
   "cosine_score": 0.5219,
   "l2_distance": 0.9777,
   "clarity_score": null,
+  "content_score": 1043.2,
+  "photo_unusable": false,
   "match_status": "match",
   "elapsed_ms": 5.4 }
 ```
 
 响应 (per-photo 错误路径):
+- 🆕 `photo_unusable` — 整张图没内容 (全黑 / 过曝纯白 / 只拍到车窗). **判在 detect 之前** —
+  这类图走到 detect 只会得到 `no_face`, 那个 code 说的是"没找到脸", 掩盖了真正的原因
+  "压根没拍到东西". 见 issue #1 + `module/face/content_gate.py`
 - `no_face` — YuNet 没检到任何 face
 - `image_read_failed` / `ref_image_read_failed` — opencv 读图失败
 - `feature_extraction_failed` — embedding 抽取异常 (catch-all)
@@ -196,6 +201,7 @@ rec#2 (S177509932310186, 唯一已知真造假) 的 imposter sign_out mean_cos=0
 | `FACE_DET_SCORE_MIN` | **0.88** | YuNet det_score < 此值 → inconclusive (Phase A.5) |
 | `FACE_BBOX_MIN_PX` | **40** | bbox min(w,h) < 此值 → inconclusive (Phase A.5) |
 | `FACE_CROP_CLARITY_MIN` | **30** | aligned crop Laplacian var < 此值 → inconclusive (Phase A.5) |
+| `FACE_PHOTO_CONTENT_MIN` | **10** | 挖掉 OSD 后中心区 Laplacian var < 此值 → `photo_unusable` (issue #1). **跟分辨率有关**, 阈值在 320×240 抓拍图上标定, 换图源要重扫参. 设 0 关闭 |
 | `FACE_SESSION_OUTLIER_MEAN_COS` | **0.20** | session_check Stage 1: photo mean_cos<此值→outlier→代训 (Phase A.7) |
 | `FACE_DETECT_MODEL_PATH` | models/face_detection_yunet_2023mar.onnx | YuNet |
 | `FACE_RECOGNIZE_MODEL_PATH` | models/face_recognition_sface_2021dec.onnx | SFace |
@@ -211,6 +217,8 @@ rec#2 (S177509932310186, 唯一已知真造假) 的 imposter sign_out mean_cos=0
 - error_code in {`no_face`, `pose_excessive`} **不**填 clarity_score (这俩走 explicit-return 分支)
 - error_code in {`image_read_failed`, `ref_image_read_failed`, `feature_extraction_failed`} **填** clarity_score
 - face_count **总是**填 (即便 no_face → 0; ref 读失败 → undefined 但 schema 里仍要 emit)
+- 🆕 `content_score` / `photo_unusable` **总是**填 (issue #1). 是**新增字段**, 老客户端忽略即可;
+  content gate 关闭 (`FACE_PHOTO_CONTENT_MIN=0`) 时 `content_score` 照算照给、`photo_unusable` 恒 false
 
 这些行为 1:1 抄 `/home/algo/face/service/face_http_server.cpp:process_training_photo` (line ~2580-2640) + `face-detection-0205` + recognizer 错误处理. 改任何一条都要先验证客户端 (TA `_populate_identity`) 不依赖.
 
@@ -225,6 +233,9 @@ pose) 上的不稳定 embedding 触发 mismatch, 错报代训 (Phase A.4 失败�
 跌到 54%).
 
 A.5 redesign 走的路:
+0. 🆕 **content gate 前置** (issue #1): 整张图有没有内容 —— 这跟 quality gates 问的**不是同一件事**.
+   quality gate 说"这张脸我看不清", content gate 说"这张图根本没有脸可看". 前者收敛成
+   `inconclusive` 是对的, 后者要能被客户区分出来 (审核页据此标「异常照片」, 见 TA #98)
 1. **显式 quality gates** (detector confidence / face size / aligned-crop clarity /
    pose) — 任一不过, 直接 inconclusive, 不参与 cos 决策
 2. **cos 中间区**: 即便过了 quality gates, cos ∈ [0.15, 0.30) 也走 inconclusive
@@ -233,6 +244,24 @@ A.5 redesign 走的路:
 实测结果: recall 100% (catch 真造假), specificity 94.9% (vs face C++ 92.3%), 代价是
 photo-level inconclusive 23% (vs face C++ ~10%). **多 13 pp inconc** 换 **少 1 个 false
 positive 学员被错查**.
+
+### content gate 的标定 (issue #1)
+
+2 万张真实归档照片 (TA prod, 320×240 抓拍图) 扫参 + 逐张看图:
+
+| `content_score <` | 命中率 | 看图结论 |
+|---|---|---|
+| 8 | 0.035% | 纯黑 |
+| **10 (默认)** | **0.075%** | 纯黑 / 过曝纯白, 无一例外 |
+| 20 | 0.225% | **已经能看到人脸 (只是暗), 不能判** |
+
+**「暗」不是判据** — 夜间训练照本来就暗且合法. 实测全图 `dark_frac ≥ 0.8` 的占 1.27%,
+逐张看过去绝大多数人脸清清楚楚. 按亮度判会大批误杀合法夜训照. Laplacian 只看**有没有
+结构**, 对全黑和过曝纯白两种失效都低, 一条规则覆盖两种.
+
+**零回归验证**: 默认阈值命中的 15 张, 逐张跑原 detect 路径 —— 13 张本来就 `no_face`,
+2 张 `detection_low_confidence` (det=0.75 < 0.88). **没有一张本来能过 gate**, 所以这个
+gate 不会丢掉任何有效判定, 只是把模糊的理由换成准确的.
 
 跟客户的话术: "AI 在能看清的 photo 上做了决定, 看不清的 photo 明确标 inconclusive 让
 你决定要不要人工复核, 不会把好学员错报代训."

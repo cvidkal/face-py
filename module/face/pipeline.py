@@ -22,13 +22,14 @@ import cv2
 import numpy as np
 
 from .clarity import compute_image_clarity_score
+from .content_gate import compute_content_score, is_photo_unusable
 from .detector import DetectedFace, FaceAligner, FaceDetector, largest_face
 from .errors import (
     COS_INCONCLUSIVE_ZONE, DETECTION_LOW_CONFIDENCE, FACE_TOO_BLURRY, FACE_TOO_SMALL,
-    FEATURE_EXTRACTION_FAILED, IMAGE_READ_FAILED, MSG_NO_FACE, NO_FACE,
+    FEATURE_EXTRACTION_FAILED, IMAGE_READ_FAILED, MSG_NO_FACE, NO_FACE, PHOTO_UNUSABLE,
     POSE_EXCESSIVE, REF_IMAGE_READ_FAILED,
     msg_cos_inconclusive_zone, msg_detection_low_confidence, msg_face_too_blurry,
-    msg_face_too_small, msg_image_read_failed, msg_pose_excessive,
+    msg_face_too_small, msg_image_read_failed, msg_photo_unusable, msg_pose_excessive,
     msg_ref_image_read_failed,
 )
 from .pose_gate import compute_head_pose
@@ -56,6 +57,10 @@ class IdentityCheckResult:
     cosine_score: Optional[float] = None
     l2_distance: Optional[float] = None
     clarity_score: Optional[float] = None
+    # issue #1: 整张图有没有内容 (挖掉 OSD 后中心区 Laplacian var). 总是产出,
+    # 让下游能审计"为什么判 unusable"; content gate 关闭时也照算照给。
+    content_score: Optional[float] = None
+    photo_unusable: bool = False
     match_status: str = "inconclusive"  # match / mismatch / inconclusive
     error_code: str = ""
     error: str = ""
@@ -67,6 +72,8 @@ class IdentityCheckResult:
             "cosine_score": self.cosine_score,
             "l2_distance": self.l2_distance,
             "clarity_score": self.clarity_score,
+            "content_score": self.content_score,
+            "photo_unusable": self.photo_unusable,
             "match_status": self.match_status,
             "error_code": self.error_code,
             "error": self.error,
@@ -84,6 +91,8 @@ class SessionPhotoResult:
     cosine_score: Optional[float] = None       # vs ref, only post-gate
     l2_distance: Optional[float] = None
     clarity_score: Optional[float] = None
+    content_score: Optional[float] = None       # issue #1
+    photo_unusable: bool = False                # issue #1
     match_status: str = "inconclusive"          # per-photo, A.5 tri-state
     error_code: str = ""
     error: str = ""
@@ -99,6 +108,8 @@ class SessionPhotoResult:
             "cosine_score": self.cosine_score,
             "l2_distance": self.l2_distance,
             "clarity_score": self.clarity_score,
+            "content_score": self.content_score,
+            "photo_unusable": self.photo_unusable,
             "match_status": self.match_status,
             "error_code": self.error_code,
             "error": self.error,
@@ -255,6 +266,18 @@ class FacePipeline:
             # face C++ 在 imread 成功后立刻算 image-level clarity, 但仅 error_code
             # 路径 emit. 我们改为只在 face-too-blurry 时算 aligned-crop clarity (后面),
             # image-level clarity 一般 dashcam 偏暗也大 — 没区分度. 这里不算.
+
+            # 1.5 content gate (issue #1): 整张图有没有内容. 放在 detect **之前** —
+            # 一张全黑图走到 detect 只会得到 no_face, 那个 error_code 说的是"没找到脸",
+            # 掩盖了真正的原因("压根没拍到东西"). 先判 content 才能给出准确的理由.
+            # 亚毫秒级 (一次 Laplacian), 不值得为省这点开销放到后面.
+            result.content_score = compute_content_score(image)
+            if is_photo_unusable(result.content_score, quality.photo_content_min):
+                result.photo_unusable = True
+                result.error_code = PHOTO_UNUSABLE
+                result.error = msg_photo_unusable(
+                    result.content_score or 0.0, quality.photo_content_min)
+                return self._finish(result, t0)
 
             # 2. 读 ref (或 cache hit)
             cache_key = RefFeatureCache.make_key(ref_image_path)
@@ -523,6 +546,14 @@ class FacePipeline:
             pr.error_code = IMAGE_READ_FAILED
             pr.error = msg_image_read_failed(image_path)
             return pr
+        gate = self.quality
+        # content gate 先于 detect — 理由同 identity_check (issue #1)
+        pr.content_score = compute_content_score(image)
+        if is_photo_unusable(pr.content_score, gate.photo_content_min):
+            pr.photo_unusable = True
+            pr.error_code = PHOTO_UNUSABLE
+            pr.error = msg_photo_unusable(pr.content_score or 0.0, gate.photo_content_min)
+            return pr
         faces = self.detector.detect(image)
         pr.face_count = len(faces)
         primary = largest_face(faces)
@@ -530,7 +561,6 @@ class FacePipeline:
             pr.error_code = NO_FACE
             pr.error = MSG_NO_FACE
             return pr
-        gate = self.quality
         if primary.score < gate.det_score_min:
             pr.error_code = DETECTION_LOW_CONFIDENCE
             pr.error = msg_detection_low_confidence(primary.score, gate.det_score_min)
