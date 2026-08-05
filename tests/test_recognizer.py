@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from module.face.recognizer import (
     classify_match, cosine_score, get_match_thresholds, is_same_person,
-    l2_distance,
+    l2_distance, cos_to_l2, l2_to_cos,
 )
 
 
@@ -52,7 +52,11 @@ class IsSamePersonTest(unittest.TestCase):
         cos_lo, cos_hi, l2_max = get_match_thresholds()
         self.assertAlmostEqual(cos_lo, 0.15)
         self.assertAlmostEqual(cos_hi, 0.30)
-        self.assertAlmostEqual(l2_max, 1.15)
+        # issue #3: l2 默认从 cos_match 推导 (归一化 embedding 下两者互为函数).
+        # 旧值 1.15 隐含 cos>=0.3388, 跟 cos_hi=0.30 不自洽 —— 这里断言 1.15 等于
+        # 把那个 bug 钉进测试, 已改成断言自洽关系。
+        self.assertAlmostEqual(l2_max, cos_to_l2(0.30), places=9)
+        self.assertAlmostEqual(l2_to_cos(l2_max), cos_hi, places=9)
 
     # classify_match (tri-state)
 
