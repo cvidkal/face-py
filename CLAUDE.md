@@ -192,7 +192,7 @@ rec#2 (S177509932310186, 唯一已知真造假) 的 imposter sign_out mean_cos=0
 | `FACE_HTTP_AUTH_REQUIRED` | auto | 跟 `auth_token` 非空联动 |
 | `FACE_COSINE_MISMATCH_THRESH` | **0.15** | cos < 此值 → mismatch (Phase A.5) |
 | `FACE_COSINE_THRESH` | **0.30** | cos ≥ 此值 + l2 OK → match. 跟 face C++ 默认 0.4 不通用 |
-| `FACE_L2_THRESH` | **1.15** | match 要求的 l2 上限 |
+| `FACE_L2_THRESH` | **由 cos 推导** | match 要求的 l2 上限. 🆕 不显式设置时 = `sqrt(2-2*FACE_COSINE_THRESH)` (issue #3). **l2 不是独立判据** — 归一化 embedding 下 `l2²=2-2cos`, 两个条件里只有更严的在生效. 旧默认 1.15 隐含 `cos>=0.3388`, 让 `FACE_COSINE_THRESH=0.30` 形同虚设. 显式设置仍生效, 但不自洽时启动 WARN |
 | `FACE_DET_SCORE_MIN` | **0.88** | YuNet det_score < 此值 → inconclusive (Phase A.5) |
 | `FACE_BBOX_MIN_PX` | **40** | bbox min(w,h) < 此值 → inconclusive (Phase A.5) |
 | `FACE_CROP_CLARITY_MIN` | **30** | aligned crop Laplacian var < 此值 → inconclusive (Phase A.5) |
@@ -229,6 +229,11 @@ A.5 redesign 走的路:
    pose) — 任一不过, 直接 inconclusive, 不参与 cos 决策
 2. **cos 中间区**: 即便过了 quality gates, cos ∈ [0.15, 0.30) 也走 inconclusive
 3. 只有 quality 好 + cos 极端 (< 0.15 OR ≥ 0.30) 才下 match/mismatch 结论
+
+> 🆕 **l2 与 cos 不是两个判据** (issue #3): embedding 归一化后 `l2 = sqrt(2-2cos)`,
+> `cos >= X and l2 <= Y` 里永远只有更严的那个生效。历史默认 (cos 0.30 + l2 1.15) 不自洽,
+> 实际门槛一直是 `cos >= 0.3388` —— 现网被判 inconclusive 的照片 `cosine_score` 最大值
+> 恰好 0.339 就是这个原因。现在 l2 默认由 cos 推导, 改 `FACE_COSINE_THRESH` 立即生效。
 
 实测结果: recall 100% (catch 真造假), specificity 94.9% (vs face C++ 92.3%), 代价是
 photo-level inconclusive 23% (vs face C++ ~10%). **多 13 pp inconc** 换 **少 1 个 false
