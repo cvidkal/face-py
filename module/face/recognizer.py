@@ -10,6 +10,7 @@ Feasibility 实测: ORT-CUDA T4 mean 1.41ms / inference (jiapei-anticheat#20 Ses
 from __future__ import annotations
 
 import logging
+import math
 import os
 from pathlib import Path
 from threading import Lock
@@ -20,6 +21,10 @@ import onnxruntime as ort
 
 
 log = logging.getLogger("face-py.recognizer")
+
+# 阈值不自洽的告警只在每种配置上打一次 —— get_match_thresholds() 是**每张照片**都调的,
+# 无脑 warn 会把生产日志淹掉 (实测 2000 张照片刷 2000 行).
+_warned_l2_configs: set[tuple[float, float]] = set()
 
 # SFace 输入是固定 1×3×112×112, 静态 shape, 给 ORT 优化器最多空间
 _SFACE_INPUT_NAME = "data"
@@ -103,6 +108,20 @@ def l2_distance(a: np.ndarray, b: np.ndarray) -> float:
 # match zone, 中间走 inconclusive), 同时加 detector + size + clarity quality gates:
 # session-level 在 customer GT 上 recall 100% specificity 94.9% accuracy 95% (好于
 # face C++ 92.3% / 92.5%), 代价是 photo-level inconclusive 率 23% (vs face C++ ~10%).
+def cos_to_l2(cos: float) -> float:
+    """L2 归一化向量下 cos → l2 的**恒等式**: l2 = sqrt(2 - 2*cos).
+
+    |a-b|^2 = |a|^2 + |b|^2 - 2*a.b = 2 - 2*cos (因为 |a|=|b|=1).
+    实测 2144 对真实照片, l2 与本式最大偏差 1.96e-07。
+    """
+    return math.sqrt(max(2.0 - 2.0 * cos, 0.0))
+
+
+def l2_to_cos(l2: float) -> float:
+    """cos_to_l2 的逆: cos = 1 - l2^2 / 2."""
+    return 1.0 - (l2 * l2) / 2.0
+
+
 def get_match_thresholds() -> tuple[float, float, float]:
     """返 (cos_mismatch_thresh, cos_match_thresh, l2_max_thresh).
 
@@ -110,11 +129,36 @@ def get_match_thresholds() -> tuple[float, float, float]:
     cos >= cos_match_thresh AND l2 <= l2_max  → match (高置信像)
     其余 → inconclusive (cos 中间区, 拿不准)
 
-    默认 0.15 / 0.30 / 1.15 (Phase A.5 sweep 出的 pareto-optimal).
+    ## l2 不是独立判据 (issue #3)
+
+    embedding 在 extract() 里做过 L2 归一化, 所以 l2 和 cos **互为函数**
+    (见 cos_to_l2), 两个条件里永远只有更严的那个在生效。历史默认
+    cos=0.30 + l2=1.15 是不自洽的 —— l2<=1.15 等价于 **cos>=0.3388**, 于是
+    FACE_COSINE_THRESH 在 0.30~0.339 区间内改了完全没效果, 实际门槛一直是 0.339。
+    (旁证: 现网被判 inconclusive 的照片 cosine_score 最大值恰好 0.339。)
+
+    现在 **`FACE_L2_THRESH` 不显式设置时从 cos_match 推导**, 保证两者自洽;
+    显式设置了就尊重它 (运维配置里可能已经写了), 但会 WARN 说明实际生效的 cos 门槛。
     """
     cos_mismatch = float(os.environ.get("FACE_COSINE_MISMATCH_THRESH", "0.15"))
-    cos_match = float(os.environ.get("FACE_COSINE_THRESH", "0.30"))
-    l2_max = float(os.environ.get("FACE_L2_THRESH", "1.15"))
+    # 0.35 是 audit 模式下扫参的工作点 (issue #1): 捞回 31.8% / 假接受 0.22%,
+    # 比历史 block+0.30 (12.3% / 1.30%) 两个维度都好。历史值: FACE_COSINE_THRESH=0.30
+    cos_match = float(os.environ.get("FACE_COSINE_THRESH", "0.35"))
+    raw_l2 = os.environ.get("FACE_L2_THRESH")
+    if raw_l2 is None or not raw_l2.strip():
+        return cos_mismatch, cos_match, cos_to_l2(cos_match)
+
+    l2_max = float(raw_l2)
+    implied = l2_to_cos(l2_max)
+    if abs(implied - cos_match) > 1e-6 and (l2_max, cos_match) not in _warned_l2_configs:
+        _warned_l2_configs.add((l2_max, cos_match))
+        binding = "l2" if implied > cos_match else "cos"
+        log.warning(
+            "FACE_L2_THRESH=%.4f implies cos>=%.4f but FACE_COSINE_THRESH=%.4f — "
+            "they are not independent (l2=sqrt(2-2cos) for normalized embeddings); "
+            "the stricter one wins, so the effective match threshold is cos>=%.4f (%s)",
+            l2_max, implied, cos_match, max(implied, cos_match), binding,
+        )
     return cos_mismatch, cos_match, l2_max
 
 

@@ -41,6 +41,10 @@ DETECTION_LOW_CONFIDENCE = "detection_low_confidence"
 FACE_TOO_SMALL = "face_too_small"
 FACE_TOO_BLURRY = "face_too_blurry"
 COS_INCONCLUSIVE_ZONE = "cos_inconclusive_zone"
+# issue #1: cos 落 mismatch 区, 但这张图 quality 不干净 → 不下"不是本人"这个指控.
+# 判错方向的代价不对称: 说"是本人"错了是漏一个代训, 说"不是本人"错了是冤枉一个
+# 正常学员被查学时. 后者贵得多, 所以只有干净的图才有资格下 mismatch.
+MISMATCH_WITHHELD_LOW_QUALITY = "mismatch_withheld_low_quality"
 
 
 # message 模板
@@ -78,6 +82,12 @@ def msg_face_too_small(min_side: float, threshold: float) -> str:
 def msg_face_too_blurry(clarity: float, threshold: float) -> str:
     return (f"aligned face crop too blurry (clarity={clarity:.1f} < {threshold:.1f}); "
              "skipped to avoid unreliable embedding")
+
+
+def msg_mismatch_withheld(cos: float, flags: list) -> str:
+    return (f"cos={cos:.3f} falls in the mismatch zone but the photo failed quality "
+            f"checks ({', '.join(flags)}); withholding the mismatch verdict — "
+            f"a false 'not the same person' is costlier than a missed one")
 
 
 def msg_cos_inconclusive_zone(cos: float, low: float, match: float) -> str:

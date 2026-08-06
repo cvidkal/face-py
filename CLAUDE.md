@@ -196,8 +196,9 @@ rec#2 (S177509932310186, 唯一已知真造假) 的 imposter sign_out mean_cos=0
 | `FACE_HTTP_AUTH_TOKEN` | (empty) | 配了就启 auth, 跟 face C++ 同协议 (Bearer / X-API-Key) |
 | `FACE_HTTP_AUTH_REQUIRED` | auto | 跟 `auth_token` 非空联动 |
 | `FACE_COSINE_MISMATCH_THRESH` | **0.15** | cos < 此值 → mismatch (Phase A.5) |
-| `FACE_COSINE_THRESH` | **0.30** | cos ≥ 此值 + l2 OK → match. 跟 face C++ 默认 0.4 不通用 |
-| `FACE_L2_THRESH` | **1.15** | match 要求的 l2 上限 |
+| `FACE_COSINE_THRESH` | **0.35** | cos ≥ 此值 → match (issue #1 扫参工作点; 历史值 0.30). 跟 face C++ 默认 0.4 不通用 |
+| `FACE_QUALITY_GATE_MODE` | **audit** | 🆕 `audit` = gate 只标记不拦判定; `block` = 历史行为 (任一 gate 不过直接 inconclusive). 完整恢复历史: `FACE_QUALITY_GATE_MODE=block` + `FACE_COSINE_THRESH=0.30` |
+| `FACE_L2_THRESH` | **由 cos 推导** | match 要求的 l2 上限. 🆕 不显式设置时 = `sqrt(2-2*FACE_COSINE_THRESH)` (issue #3). **l2 不是独立判据** — 归一化 embedding 下 `l2²=2-2cos`, 两个条件里只有更严的在生效. 旧默认 1.15 隐含 `cos>=0.3388`, 让 `FACE_COSINE_THRESH=0.30` 形同虚设. 显式设置仍生效, 但不自洽时启动 WARN |
 | `FACE_DET_SCORE_MIN` | **0.88** | YuNet det_score < 此值 → inconclusive (Phase A.5) |
 | `FACE_BBOX_MIN_PX` | **40** | bbox min(w,h) < 此值 → inconclusive (Phase A.5) |
 | `FACE_CROP_CLARITY_MIN` | **30** | aligned crop Laplacian var < 此值 → inconclusive (Phase A.5) |
@@ -219,6 +220,9 @@ rec#2 (S177509932310186, 唯一已知真造假) 的 imposter sign_out mean_cos=0
 - face_count **总是**填 (即便 no_face → 0; ref 读失败 → undefined 但 schema 里仍要 emit)
 - 🆕 `content_score` / `photo_unusable` **总是**填 (issue #1). 是**新增字段**, 老客户端忽略即可;
   content gate 关闭 (`FACE_PHOTO_CONTENT_MIN=0`) 时 `content_score` 照算照给、`photo_unusable` 恒 false
+- 🆕 (issue #1) 新增 `quality_flags` (list, gate 全过 = `[]`) + `det_score` / `bbox_min_px` /
+  `yaw_ratio` / `pitch_ratio`。**有 flag 不代表没结论** —— audit 模式下照样出 match/mismatch,
+  flag 只是告诉客户"这个结论基于一张什么样的图"。老客户端忽略新字段即可
 
 这些行为 1:1 抄 `/home/algo/face/service/face_http_server.cpp:process_training_photo` (line ~2580-2640) + `face-detection-0205` + recognizer 错误处理. 改任何一条都要先验证客户端 (TA `_populate_identity`) 不依赖.
 
@@ -238,8 +242,19 @@ A.5 redesign 走的路:
    `inconclusive` 是对的, 后者要能被客户区分出来 (审核页据此标「异常照片」, 见 TA #98)
 1. **显式 quality gates** (detector confidence / face size / aligned-crop clarity /
    pose) — 任一不过, 直接 inconclusive, 不参与 cos 决策
+1. ~~**显式 quality gates** — 任一不过, 直接 inconclusive, 不参与 cos 决策~~
+   🆕 **issue #1 起改为 audit**: gate 不再拦判定, 降级为 `quality_flags` 审计信号。
+   依据: 154 张人工确认「实际是本人」+ 462 对**画质配平**冒名对 (同一张照片配别人的 ref)
+   实测, 四道 gate 对正负样本的拦截率**完全相同** (det 33.8%/33.8%, clarity 26.0%/26.0%,
+   pose 25.3%/25.3%, bbox 10.4%/10.4%) —— 它们过滤的是"图好不好", 跟"是不是同一个人"
+   正交, 所以只砍召回不买特异性
 2. **cos 中间区**: 即便过了 quality gates, cos ∈ [0.15, 0.30) 也走 inconclusive
 3. 只有 quality 好 + cos 极端 (< 0.15 OR ≥ 0.30) 才下 match/mismatch 结论
+
+> 🆕 **l2 与 cos 不是两个判据** (issue #3): embedding 归一化后 `l2 = sqrt(2-2cos)`,
+> `cos >= X and l2 <= Y` 里永远只有更严的那个生效。历史默认 (cos 0.30 + l2 1.15) 不自洽,
+> 实际门槛一直是 `cos >= 0.3388` —— 现网被判 inconclusive 的照片 `cosine_score` 最大值
+> 恰好 0.339 就是这个原因。现在 l2 默认由 cos 推导, 改 `FACE_COSINE_THRESH` 立即生效。
 
 实测结果: recall 100% (catch 真造假), specificity 94.9% (vs face C++ 92.3%), 代价是
 photo-level inconclusive 23% (vs face C++ ~10%). **多 13 pp inconc** 换 **少 1 个 false
@@ -262,6 +277,28 @@ positive 学员被错查**.
 **零回归验证**: 默认阈值命中的 15 张, 逐张跑原 detect 路径 —— 13 张本来就 `no_face`,
 2 张 `detection_low_confidence` (det=0.75 < 0.88). **没有一张本来能过 gate**, 所以这个
 gate 不会丢掉任何有效判定, 只是把模糊的理由换成准确的.
+### issue #1: gate 降级为审计 + 判错方向不对称
+
+**「诚实 inconclusive」的意图没变 — 不确定就别下结论。变的是用什么表达不确定**:
+不再用画质当代理, 而是用 cos 中间区 (区间反而更宽: 0.15~0.35 vs 0.15~0.30)。
+
+**关键的不对称** (`pipeline._verdict_with_quality`): quality 不干净时**只压制 mismatch,
+不压制 match**。说"是本人"错了 = 漏一个代训; 说"不是本人"错了 = **冤枉一个正常学员被查
+学时**。后者贵得多, 所以只有干净的图才有资格下指控 (压制时 error_code =
+`mismatch_withheld_low_quality`)。
+
+不加这条不对称的话, 正样本误判 mismatch 会从 4 张涨到 19 张 —— 那正是 A.5 当初要防的错。
+
+端到端实测 (2155 对真实照片, 用发布的 pipeline 跑):
+
+| | 正:match | 正:误判 mismatch | 负:假接受 | 负:抓到 mismatch |
+|---|---|---|---|---|
+| 历史 (block + cos 0.30) | 19 (12.3%) | 4 | 52 (2.60%) | 1058 (52.9%) |
+| **新默认 (audit + cos 0.35)** | **49 (31.6%)** | **4** | **16 (0.80%)** | 1058 (52.9%) |
+
+**`passes_gate` 语义不变** —— 它继续决定哪些 embedding 进 Stage 1 聚类 / Stage 2 prototype。
+实测只覆盖照片级判定, 把低质量 embedding 放进聚类**没有数据支撑**, 噪声 embedding 可能造出
+假 outlier → 课次级误报代训。这条刻意没动。
 
 跟客户的话术: "AI 在能看清的 photo 上做了决定, 看不清的 photo 明确标 inconclusive 让
 你决定要不要人工复核, 不会把好学员错报代训."
