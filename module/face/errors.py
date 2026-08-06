@@ -15,6 +15,7 @@
 | feature_extraction_failed | 通用 catch-all | 同 | 异常兜底 |
 | **detection_low_confidence** | (无) | det_score < FACE_DET_SCORE_MIN (默认 0.88) | YuNet 自己说不可信 (新, Phase A.5) |
 | **face_too_small** | (无) | bbox min(w,h) < FACE_BBOX_MIN_PX (默认 40) | source face 太小, SFace input 不可靠 (新) |
+| **photo_unusable** | (无) | 挖掉 OSD 后中心区 Laplacian var < FACE_PHOTO_CONTENT_MIN (默认 10) | 整张图没内容: 全黑/过曝/没拍到 (新, issue #1) |
 | **face_too_blurry** | (无) | aligned face clarity < FACE_CROP_CLARITY_MIN (默认 30) | aligned crop 太模糊 (新) |
 | **cos_inconclusive_zone** | (无) | cos 落 [cos_low, cos_match) 之间 | cos 在不确定区, 类似 face#13 patch (新) |
 
@@ -24,6 +25,9 @@ TA 现有行为, 业务向前兼容.
 """
 from __future__ import annotations
 
+
+# 输入不可用类 (issue #1): 图本身没内容, 区别于"拍到了但看不清"
+PHOTO_UNUSABLE = "photo_unusable"
 
 # 真失败类
 IMAGE_READ_FAILED = "image_read_failed"
@@ -44,6 +48,11 @@ MISMATCH_WITHHELD_LOW_QUALITY = "mismatch_withheld_low_quality"
 
 
 # message 模板
+def msg_photo_unusable(score: float, threshold: float) -> str:
+    return (f"photo has no discernible content (content_score={score:.1f} < "
+            f"{threshold:.1f}); likely all-black / blown-out / nothing captured")
+
+
 def msg_image_read_failed(path: str) -> str:
     return f"Cannot read image: {path}"
 

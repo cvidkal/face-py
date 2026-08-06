@@ -53,7 +53,16 @@ class QualityGateConfig:
     # aligned 112×112 crop 的 Laplacian variance. < 30 是糊到看不清五官. 30 比较松,
     # customer 数据 p10 是 65 — 30 这个阈值仅 cut 真糊照, 不误伤一般 dashcam 质量.
     face_crop_clarity_min: float = 30.0
-    # gate 是拦下判定 ("block") 还是只做审计标记 ("audit"). 见上面注释.
+    # 挖掉 OSD 带后中心区的 Laplacian variance 下限 — 低于它认为"整张图没内容"
+    # (全黑 / 过曝纯白 / 只拍到车窗). 10.0 是 2 万张真实归档照片扫参 + 逐张看图定的,
+    # 命中率 0.075%; 13~25 那一带还能看到人脸, 不能判. 详见 content_gate.py docstring.
+    # 设 0 关闭该 gate. **跟分辨率有关**, 换图源要重新标定.
+    #
+    # ⚠️ 这个 gate **不受 mode 影响, 永远拦截** —— 它跟上面四个不是一回事:
+    # 上面四个问"这张脸看得清吗"(实测跟身份正交, 所以降级为审计), 这个问"这张图有
+    # 内容吗"。全黑/过曝图**根本没有脸可比**, 放行下去只会得到一个假的 cos。
+    photo_content_min: float = 10.0
+    # 上面四个 quality gate 是拦下判定 ("block") 还是只做审计标记 ("audit").
     # 恢复历史行为: FACE_QUALITY_GATE_MODE=block + FACE_COSINE_THRESH=0.30
     mode: str = GATE_MODE_AUDIT
     # head pose 阈值, 跟 face C++ #13 patch 后默认一致. 这俩在 pose_gate.py 也读
@@ -67,6 +76,7 @@ class QualityGateConfig:
             det_score_min=float(os.environ.get("FACE_DET_SCORE_MIN", "0.88")),
             face_bbox_min_px=float(os.environ.get("FACE_BBOX_MIN_PX", "40")),
             face_crop_clarity_min=float(os.environ.get("FACE_CROP_CLARITY_MIN", "30")),
+            photo_content_min=float(os.environ.get("FACE_PHOTO_CONTENT_MIN", "10")),
             mode=(os.environ.get("FACE_QUALITY_GATE_MODE", GATE_MODE_AUDIT).strip().lower()
                   or GATE_MODE_AUDIT),
             yaw_max=float(os.environ.get("FACE_POSE_ABS_YAW", "0.35")),
