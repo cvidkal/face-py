@@ -141,7 +141,9 @@ def get_match_thresholds() -> tuple[float, float, float]:
     显式设置了就尊重它 (运维配置里可能已经写了), 但会 WARN 说明实际生效的 cos 门槛。
     """
     cos_mismatch = float(os.environ.get("FACE_COSINE_MISMATCH_THRESH", "0.15"))
-    cos_match = float(os.environ.get("FACE_COSINE_THRESH", "0.30"))
+    # 0.35 是 audit 模式下扫参的工作点 (issue #1): 捞回 31.8% / 假接受 0.22%,
+    # 比历史 block+0.30 (12.3% / 1.30%) 两个维度都好。历史值: FACE_COSINE_THRESH=0.30
+    cos_match = float(os.environ.get("FACE_COSINE_THRESH", "0.35"))
     raw_l2 = os.environ.get("FACE_L2_THRESH")
     if raw_l2 is None or not raw_l2.strip():
         return cos_mismatch, cos_match, cos_to_l2(cos_match)

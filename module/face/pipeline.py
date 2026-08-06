@@ -25,11 +25,11 @@ from .clarity import compute_image_clarity_score
 from .detector import DetectedFace, FaceAligner, FaceDetector, largest_face
 from .errors import (
     COS_INCONCLUSIVE_ZONE, DETECTION_LOW_CONFIDENCE, FACE_TOO_BLURRY, FACE_TOO_SMALL,
-    FEATURE_EXTRACTION_FAILED, IMAGE_READ_FAILED, MSG_NO_FACE, NO_FACE,
-    POSE_EXCESSIVE, REF_IMAGE_READ_FAILED,
+    FEATURE_EXTRACTION_FAILED, IMAGE_READ_FAILED, MISMATCH_WITHHELD_LOW_QUALITY,
+    MSG_NO_FACE, NO_FACE, POSE_EXCESSIVE, REF_IMAGE_READ_FAILED,
     msg_cos_inconclusive_zone, msg_detection_low_confidence, msg_face_too_blurry,
-    msg_face_too_small, msg_image_read_failed, msg_pose_excessive,
-    msg_ref_image_read_failed,
+    msg_face_too_small, msg_image_read_failed, msg_mismatch_withheld,
+    msg_pose_excessive, msg_ref_image_read_failed,
 )
 from .pose_gate import compute_head_pose
 from .quality_gate import QualityGateConfig
@@ -41,6 +41,21 @@ from .session_consistency import check_internal_consistency, session_prototype
 
 
 log = logging.getLogger("face-py.pipeline")
+
+
+def _verdict_with_quality(cos: float, l2: float, quality_flags: list) -> tuple[str, str]:
+    """issue #1 的不对称规则: quality 不干净时**只**压制 mismatch, 不压制 match.
+
+    实测 (154 正 / 2000 负): gate 全不拦会把正样本误判 mismatch 从 4 张涨到 19 张 ——
+    误报代训正是「诚实 inconclusive」当初要防的最贵的错。只拦 mismatch 方向:
+    捞回仍是 31.6%, 假接受仍是 0.80%, 误判 mismatch 回到 4 张。
+
+    返 (match_status, 需要标的 error_code 或空串).
+    """
+    verdict = classify_match(cos, l2)
+    if verdict == "mismatch" and quality_flags:
+        return "inconclusive", MISMATCH_WITHHELD_LOW_QUALITY
+    return verdict, ""
 
 
 # =============================================================================
@@ -56,6 +71,13 @@ class IdentityCheckResult:
     cosine_score: Optional[float] = None
     l2_distance: Optional[float] = None
     clarity_score: Optional[float] = None
+    # issue #1: quality gate 降级为审计信号 —— 没拦下判定, 但把「这个结论基于一张什么样
+    # 的图」透给客户, 人工复核时能看到。gate 全过 = 空 list。
+    quality_flags: list = field(default_factory=list)
+    det_score: Optional[float] = None
+    bbox_min_px: Optional[float] = None
+    yaw_ratio: Optional[float] = None
+    pitch_ratio: Optional[float] = None
     match_status: str = "inconclusive"  # match / mismatch / inconclusive
     error_code: str = ""
     error: str = ""
@@ -67,6 +89,11 @@ class IdentityCheckResult:
             "cosine_score": self.cosine_score,
             "l2_distance": self.l2_distance,
             "clarity_score": self.clarity_score,
+            "quality_flags": list(self.quality_flags),
+            "det_score": self.det_score,
+            "bbox_min_px": self.bbox_min_px,
+            "yaw_ratio": self.yaw_ratio,
+            "pitch_ratio": self.pitch_ratio,
             "match_status": self.match_status,
             "error_code": self.error_code,
             "error": self.error,
@@ -84,6 +111,7 @@ class SessionPhotoResult:
     cosine_score: Optional[float] = None       # vs ref, only post-gate
     l2_distance: Optional[float] = None
     clarity_score: Optional[float] = None
+    quality_flags: list = field(default_factory=list)   # issue #1
     match_status: str = "inconclusive"          # per-photo, A.5 tri-state
     error_code: str = ""
     error: str = ""
@@ -99,6 +127,7 @@ class SessionPhotoResult:
             "cosine_score": self.cosine_score,
             "l2_distance": self.l2_distance,
             "clarity_score": self.clarity_score,
+            "quality_flags": list(self.quality_flags),
             "match_status": self.match_status,
             "error_code": self.error_code,
             "error": self.error,
@@ -277,28 +306,30 @@ class FacePipeline:
                 result.error = MSG_NO_FACE
                 return self._finish(result, t0)
 
-            # 4. detection confidence gate (Phase A.5)
-            if primary.score < quality.det_score_min:
-                result.error_code = DETECTION_LOW_CONFIDENCE
-                result.error = msg_detection_low_confidence(
-                    primary.score, quality.det_score_min)
-                return self._finish(result, t0)
-
-            # 5. face size gate (Phase A.5)
+            # 4-6. quality gates (Phase A.5) — issue #1 起默认只标记不拦截.
+            # block 模式 (FACE_QUALITY_GATE_MODE=block) 恢复历史的"直接 inconclusive".
             bbox_min_side = min(primary.bbox_xywh[2], primary.bbox_xywh[3])
-            if bbox_min_side < quality.face_bbox_min_px:
-                result.error_code = FACE_TOO_SMALL
-                result.error = msg_face_too_small(
-                    bbox_min_side, quality.face_bbox_min_px)
-                return self._finish(result, t0)
-
-            # 6. pose gate (cheap, 算几何不用 inference)
             pose = compute_head_pose(primary.landmarks)
-            if (abs(pose.yaw_ratio) > quality.yaw_max or
-                    abs(pose.pitch_ratio) > quality.pitch_max):
-                result.error_code = POSE_EXCESSIVE
-                result.error = msg_pose_excessive(pose.yaw_ratio, pose.pitch_ratio)
-                return self._finish(result, t0)
+            result.det_score = float(primary.score)
+            result.bbox_min_px = float(bbox_min_side)
+            result.yaw_ratio = float(pose.yaw_ratio)
+            result.pitch_ratio = float(pose.pitch_ratio)
+            for code, failed, msg in (
+                (DETECTION_LOW_CONFIDENCE, primary.score < quality.det_score_min,
+                 lambda: msg_detection_low_confidence(primary.score, quality.det_score_min)),
+                (FACE_TOO_SMALL, bbox_min_side < quality.face_bbox_min_px,
+                 lambda: msg_face_too_small(bbox_min_side, quality.face_bbox_min_px)),
+                (POSE_EXCESSIVE, (abs(pose.yaw_ratio) > quality.yaw_max
+                                  or abs(pose.pitch_ratio) > quality.pitch_max),
+                 lambda: msg_pose_excessive(pose.yaw_ratio, pose.pitch_ratio)),
+            ):
+                if not failed:
+                    continue
+                result.quality_flags.append(code)
+                if quality.blocks:
+                    result.error_code = code
+                    result.error = msg()
+                    return self._finish(result, t0)
 
             # 7. align (~3ms) + 8. aligned-crop clarity gate
             try:
@@ -308,12 +339,14 @@ class FacePipeline:
                 result.error = str(exc)
                 return self._finish(result, t0)
             crop_clarity = compute_image_clarity_score(aligned)
+            result.clarity_score = crop_clarity
             if crop_clarity is None or crop_clarity < quality.face_crop_clarity_min:
-                result.error_code = FACE_TOO_BLURRY
-                result.error = msg_face_too_blurry(
-                    crop_clarity or 0.0, quality.face_crop_clarity_min)
-                result.clarity_score = crop_clarity
-                return self._finish(result, t0)
+                result.quality_flags.append(FACE_TOO_BLURRY)
+                if quality.blocks:
+                    result.error_code = FACE_TOO_BLURRY
+                    result.error = msg_face_too_blurry(
+                        crop_clarity or 0.0, quality.face_crop_clarity_min)
+                    return self._finish(result, t0)
 
             # 9. extract embedding
             try:
@@ -351,9 +384,12 @@ class FacePipeline:
             l2 = l2_distance(emb_photo, emb_ref)
             result.cosine_score = cos
             result.l2_distance = l2
-            verdict = classify_match(cos, l2)
+            verdict, withheld = _verdict_with_quality(cos, l2, result.quality_flags)
             result.match_status = verdict
-            if verdict == "inconclusive":
+            if withheld:
+                result.error_code = withheld
+                result.error = msg_mismatch_withheld(cos, result.quality_flags)
+            elif verdict == "inconclusive":
                 cos_lo, cos_hi, _ = get_match_thresholds()
                 result.error_code = COS_INCONCLUSIVE_ZONE
                 result.error = msg_cos_inconclusive_zone(cos, cos_lo, cos_hi)
@@ -419,19 +455,21 @@ class FacePipeline:
             emb_to_photo_idx: list[int] = []           # parallel to embeddings
             for p in photos:
                 pr = self._process_photo_for_session(p)
-                # Compute per-photo cos vs ref now (cheap), regardless of gate —
-                # gives clients diagnostic info even on gate-failed photos.
-                if pr.passes_gate:
-                    # We need the embedding again to compare to ref. Re-extract is
-                    # wasteful; instead _process_photo_for_session can return
-                    # embedding too. We stuff it in a private attr.
-                    emb = getattr(pr, "_embedding", None)
-                    if emb is not None:
-                        cos_v = cosine_score(emb, emb_ref)
-                        l2_v = float(l2_distance(emb, emb_ref))
-                        pr.cosine_score = cos_v
-                        pr.l2_distance = l2_v
-                        pr.match_status = classify_match(cos_v, l2_v)
+                # issue #1: 只要抽出了 embedding 就给这张照片自己的 cos/判定 —— 哪怕
+                # 带 quality_flags。但**只有 passes_gate 的进聚类** (embeddings),
+                # 因为低质量 embedding 对 Stage 1 的影响没有实测数据支撑。
+                emb = getattr(pr, "_embedding", None)
+                if emb is not None:
+                    cos_v = cosine_score(emb, emb_ref)
+                    l2_v = float(l2_distance(emb, emb_ref))
+                    pr.cosine_score = cos_v
+                    pr.l2_distance = l2_v
+                    pr.match_status, withheld = _verdict_with_quality(
+                        cos_v, l2_v, pr.quality_flags)
+                    if withheld and not pr.error_code:
+                        pr.error_code = withheld
+                        pr.error = msg_mismatch_withheld(cos_v, pr.quality_flags)
+                    if pr.passes_gate:
                         embeddings.append(emb)
                         emb_to_photo_idx.append(len(result.photo_results))
                 # Drop the private attr before serialization
@@ -531,21 +569,28 @@ class FacePipeline:
             pr.error = MSG_NO_FACE
             return pr
         gate = self.quality
-        if primary.score < gate.det_score_min:
-            pr.error_code = DETECTION_LOW_CONFIDENCE
-            pr.error = msg_detection_low_confidence(primary.score, gate.det_score_min)
-            return pr
         bbox_min_side = min(primary.bbox_xywh[2], primary.bbox_xywh[3])
-        if bbox_min_side < gate.face_bbox_min_px:
-            pr.error_code = FACE_TOO_SMALL
-            pr.error = msg_face_too_small(bbox_min_side, gate.face_bbox_min_px)
-            return pr
         pose = compute_head_pose(primary.landmarks)
-        if (abs(pose.yaw_ratio) > gate.yaw_max
-                or abs(pose.pitch_ratio) > gate.pitch_max):
-            pr.error_code = POSE_EXCESSIVE
-            pr.error = msg_pose_excessive(pose.yaw_ratio, pose.pitch_ratio)
-            return pr
+        # issue #1: audit 模式下 gate 只标记不拦截 —— 但 **passes_gate 的语义不变**,
+        # 它继续决定哪些 embedding 进 Stage 1 聚类 / Stage 2 prototype。
+        # 理由: 实测只覆盖「照片级判定」, 把低质量 embedding 放进聚类是**没测过**的,
+        # 噪声 embedding 可能造出假 outlier → 课次级误报代训 (最贵的那种错).
+        for code, failed, msg in (
+            (DETECTION_LOW_CONFIDENCE, primary.score < gate.det_score_min,
+             lambda: msg_detection_low_confidence(primary.score, gate.det_score_min)),
+            (FACE_TOO_SMALL, bbox_min_side < gate.face_bbox_min_px,
+             lambda: msg_face_too_small(bbox_min_side, gate.face_bbox_min_px)),
+            (POSE_EXCESSIVE, (abs(pose.yaw_ratio) > gate.yaw_max
+                              or abs(pose.pitch_ratio) > gate.pitch_max),
+             lambda: msg_pose_excessive(pose.yaw_ratio, pose.pitch_ratio)),
+        ):
+            if not failed:
+                continue
+            pr.quality_flags.append(code)
+            if gate.blocks:
+                pr.error_code = code
+                pr.error = msg()
+                return pr
         try:
             aligned = self.aligner.align(image, primary)
         except Exception as exc:
@@ -555,16 +600,19 @@ class FacePipeline:
         clarity = compute_image_clarity_score(aligned)
         pr.clarity_score = float(clarity) if clarity is not None else None
         if clarity is None or clarity < gate.face_crop_clarity_min:
-            pr.error_code = FACE_TOO_BLURRY
-            pr.error = msg_face_too_blurry(clarity or 0.0, gate.face_crop_clarity_min)
-            return pr
+            pr.quality_flags.append(FACE_TOO_BLURRY)
+            if gate.blocks:
+                pr.error_code = FACE_TOO_BLURRY
+                pr.error = msg_face_too_blurry(clarity or 0.0, gate.face_crop_clarity_min)
+                return pr
         try:
             emb = self.recognizer.extract(aligned)
         except Exception as exc:
             pr.error_code = FEATURE_EXTRACTION_FAILED
             pr.error = str(exc)
             return pr
-        pr.passes_gate = True
+        # 质量全过才算 post-gate (进聚类); 有 flag 的照片仍会拿到自己的 cos/判定
+        pr.passes_gate = not pr.quality_flags
         # Attach embedding for caller — stripped before serialization
         pr._embedding = emb  # type: ignore[attr-defined]
         return pr

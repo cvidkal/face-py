@@ -51,11 +51,13 @@ class IsSamePersonTest(unittest.TestCase):
     def test_default_thresholds(self) -> None:
         cos_lo, cos_hi, l2_max = get_match_thresholds()
         self.assertAlmostEqual(cos_lo, 0.15)
-        self.assertAlmostEqual(cos_hi, 0.30)
+        # issue #1: 默认 0.30 → 0.35 (audit 模式扫参工作点). 历史值靠
+        # FACE_COSINE_THRESH=0.30 + FACE_QUALITY_GATE_MODE=block 恢复。
+        self.assertAlmostEqual(cos_hi, 0.35)
         # issue #3: l2 默认从 cos_match 推导 (归一化 embedding 下两者互为函数).
-        # 旧值 1.15 隐含 cos>=0.3388, 跟 cos_hi=0.30 不自洽 —— 这里断言 1.15 等于
-        # 把那个 bug 钉进测试, 已改成断言自洽关系。
-        self.assertAlmostEqual(l2_max, cos_to_l2(0.30), places=9)
+        # 旧值 1.15 隐含 cos>=0.3388, 跟 cos_hi 不自洽 —— 断言 1.15 等于把那个 bug
+        # 钉进测试, 已改成断言自洽关系。
+        self.assertAlmostEqual(l2_max, cos_to_l2(cos_hi), places=9)
         self.assertAlmostEqual(l2_to_cos(l2_max), cos_hi, places=9)
 
     # classify_match (tri-state)
@@ -69,12 +71,15 @@ class IsSamePersonTest(unittest.TestCase):
         self.assertEqual(classify_match(0.10, 0.9), "mismatch")
 
     def test_classify_gap_inconclusive(self) -> None:
-        # cos=0.20 ∈ [0.15, 0.30), 中间区
-        self.assertEqual(classify_match(0.20, 0.9), "inconclusive")
-        # 边界: cos 恰等于 0.15 — 不是 mismatch (>=), 是 inconclusive
-        self.assertEqual(classify_match(0.15, 0.9), "inconclusive")
-        # 边界: cos 恰等于 0.30 + l2 OK — match
-        self.assertEqual(classify_match(0.30, 1.0), "match")
+        # 显式传阈值 —— 这条测的是"中间区"这个机制, 不是默认值取多少
+        lo, hi = 0.15, 0.30
+        kw = dict(cos_mismatch_thresh=lo, cos_match_thresh=hi,
+                  l2_max_thresh=cos_to_l2(hi))
+        self.assertEqual(classify_match(0.20, 0.9, **kw), "inconclusive")
+        # 边界: cos 恰等于下界 — 不是 mismatch (>=), 是 inconclusive
+        self.assertEqual(classify_match(lo, 0.9, **kw), "inconclusive")
+        # 边界: cos 恰等于上界 — match
+        self.assertEqual(classify_match(hi, cos_to_l2(hi), **kw), "match")
 
     def test_classify_high_l2_blocks_match(self) -> None:
         # cos 够高但 l2 越线 — 不算 match. 也不算 mismatch (cos 不够低). → inconclusive
@@ -99,9 +104,10 @@ class IsSamePersonTest(unittest.TestCase):
     # is_same_person (legacy bool, 给 /face/compare 用)
 
     def test_is_same_person_default(self) -> None:
-        self.assertTrue(is_same_person(0.30, 1.0))     # 恰到阈值
-        self.assertFalse(is_same_person(0.29, 1.0))    # cos 差一点
-        self.assertFalse(is_same_person(0.30, 1.20))   # l2 超
+        _, cos_hi, l2_max = get_match_thresholds()
+        self.assertTrue(is_same_person(cos_hi, l2_max))            # 恰到阈值
+        self.assertFalse(is_same_person(cos_hi - 0.01, l2_max))    # cos 差一点
+        self.assertFalse(is_same_person(cos_hi, l2_max + 0.05))    # l2 超
 
 
 if __name__ == "__main__":
