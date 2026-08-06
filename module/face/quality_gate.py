@@ -21,6 +21,20 @@ import os
 from dataclasses import dataclass
 
 
+def _env_num(name: str, default: float) -> float:
+    """读数值型 env; **空串等同未设置**.
+
+    docker compose 的 `${VAR:-}` 在 .env 里没这个键时传的是**空字符串**而不是
+    不传, 而 os.environ.get(name, "10") 的默认值只在 key 缺失时生效 —— 于是
+    float("") 直接 ValueError, 服务起不来。k8s 的可选 env 同理。
+    (2026-08-06 dev 演练实测: cloth / face 双双 CrashLoop, 幸好没上 prod。)
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw)
+
+
 # gate 的两种用法 (issue #1):
 #   "block" — 历史行为: 任一 gate 不过 → 直接 inconclusive, 不做比对
 #   "audit" — 默认: 照常比对、按 cos 定档, gate 结果作为**审计信号**透出去
@@ -73,14 +87,14 @@ class QualityGateConfig:
     @classmethod
     def from_env(cls) -> "QualityGateConfig":
         return cls(
-            det_score_min=float(os.environ.get("FACE_DET_SCORE_MIN", "0.88")),
-            face_bbox_min_px=float(os.environ.get("FACE_BBOX_MIN_PX", "40")),
-            face_crop_clarity_min=float(os.environ.get("FACE_CROP_CLARITY_MIN", "30")),
-            photo_content_min=float(os.environ.get("FACE_PHOTO_CONTENT_MIN", "10")),
+            det_score_min=_env_num("FACE_DET_SCORE_MIN", 0.88),
+            face_bbox_min_px=_env_num("FACE_BBOX_MIN_PX", 40.0),
+            face_crop_clarity_min=_env_num("FACE_CROP_CLARITY_MIN", 30.0),
+            photo_content_min=_env_num("FACE_PHOTO_CONTENT_MIN", 10.0),
             mode=(os.environ.get("FACE_QUALITY_GATE_MODE", GATE_MODE_AUDIT).strip().lower()
                   or GATE_MODE_AUDIT),
-            yaw_max=float(os.environ.get("FACE_POSE_ABS_YAW", "0.35")),
-            pitch_max=float(os.environ.get("FACE_POSE_ABS_PITCH", "0.55")),
+            yaw_max=_env_num("FACE_POSE_ABS_YAW", 0.35),
+            pitch_max=_env_num("FACE_POSE_ABS_PITCH", 0.55),
         )
 
     @property

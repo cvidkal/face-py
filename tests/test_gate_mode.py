@@ -157,5 +157,39 @@ class AsymmetricMismatchTests(unittest.TestCase):
         self.assertEqual(code, "")      # 本来就是中间区, 不是被压制的
 
 
+
+
+class EmptyEnvTests(unittest.TestCase):
+    """compose 的 ${VAR:-} 传的是**空串**不是"不传" —— 空串必须等同未设置.
+
+    2026-08-06 dev 演练实测: 空串让 float("") 抛 ValueError, cloth/face 双双
+    CrashLoop。幸好是在 dev 抓到的。
+    """
+
+    def setUp(self) -> None:
+        self._old = dict(os.environ)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old)
+
+    def test_empty_strings_fall_back_to_defaults(self) -> None:
+        for k in ("FACE_DET_SCORE_MIN", "FACE_BBOX_MIN_PX", "FACE_CROP_CLARITY_MIN",
+                  "FACE_PHOTO_CONTENT_MIN", "FACE_POSE_ABS_YAW", "FACE_POSE_ABS_PITCH"):
+            os.environ[k] = ""
+        c = QualityGateConfig.from_env()
+        self.assertEqual(c.det_score_min, 0.88)
+        self.assertEqual(c.photo_content_min, 10.0)
+        self.assertEqual(c.yaw_max, 0.35)
+
+    def test_whitespace_only_also_treated_as_unset(self) -> None:
+        os.environ["FACE_PHOTO_CONTENT_MIN"] = "   "
+        self.assertEqual(QualityGateConfig.from_env().photo_content_min, 10.0)
+
+    def test_real_value_still_wins(self) -> None:
+        os.environ["FACE_PHOTO_CONTENT_MIN"] = "25"
+        self.assertEqual(QualityGateConfig.from_env().photo_content_min, 25.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
