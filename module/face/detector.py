@@ -15,9 +15,9 @@
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 import cv2
@@ -36,8 +36,8 @@ class FaceDetector:
     """thread-safe wrap around cv2.FaceDetectorYN.
 
     OpenCV 的 detector 实例本身**不是 thread-safe** — 多线程 detect 同一个 instance
-    会乱. 这里没加锁, 由调用层 (pipeline / serve handler) 保证.
-    Phase A.2 当前没并发, 单 instance 单线程; 后续如需扩 worker pool 加 RLock.
+    会造成 native heap corruption. HTTP 层使用 ThreadingHTTPServer, 因此锁必须放在
+    这个共享对象边界内, 不能依赖每个调用方记得串行化.
     """
 
     def __init__(self, model_path: str,
@@ -59,6 +59,7 @@ class FaceDetector:
             nms_threshold=nms_threshold,
             top_k=top_k,
         )
+        self._lock = Lock()
 
     def detect(self, image: np.ndarray) -> list[DetectedFace]:
         """返回所有检到的脸. 失败 / 没脸返空 list, 不抛异常."""
@@ -66,8 +67,10 @@ class FaceDetector:
             return []
         h, w = image.shape[:2]
         # YuNet 用固定输入 size, setInputSize 会让它 resize, faces 坐标已 unscale 回原图
-        self._detector.setInputSize((w, h))
-        _, faces = self._detector.detect(image)
+        # setInputSize 改写 detector 内部状态, 必须跟随后的 detect 在同一临界区.
+        with self._lock:
+            self._detector.setInputSize((w, h))
+            _, faces = self._detector.detect(image)
         if faces is None:
             return []
         results: list[DetectedFace] = []
@@ -106,6 +109,7 @@ class FaceAligner:
         if not Path(sface_model_path).exists():
             raise FileNotFoundError(f"SFace model not found: {sface_model_path}")
         self._sface = cv2.FaceRecognizerSF.create(sface_model_path, "")
+        self._lock = Lock()
 
     def align(self, image: np.ndarray, face: DetectedFace) -> np.ndarray:
         """返 112×112 BGR aligned crop, dtype uint8.
@@ -113,4 +117,5 @@ class FaceAligner:
         face.raw_record 是 alignCrop 期望的 15-d 向量 (bbox+landmarks+score),
         直接喂回去就行.
         """
-        return self._sface.alignCrop(image, face.raw_record)
+        with self._lock:
+            return self._sface.alignCrop(image, face.raw_record)
