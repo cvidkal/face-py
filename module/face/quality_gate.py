@@ -19,6 +19,17 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Sequence
+
+from .errors import COS_INCONCLUSIVE_ZONE
+
+if TYPE_CHECKING:
+    from .pipeline import SessionPhotoResult
+
+
+CONSENSUS_COS_MIN = 0.30
+PRODUCTION_COS_MATCH = 0.35
+CONSENSUS_MIN_MATCH_PEERS = 2
 
 
 def _env_num(name: str, default: float) -> float:
@@ -51,6 +62,71 @@ def _env_num(name: str, default: float) -> float:
 # 不再用画质当代理, 而是用 cos 中间区。区间反而更宽了 (0.15~0.35 vs 0.15~0.30)。
 GATE_MODE_BLOCK = "block"
 GATE_MODE_AUDIT = "audit"
+
+
+def session_match_consensus_enabled() -> bool:
+    """Whether the production-shaped session consensus helper is enabled.
+
+    Deliberately separate from QualityGateConfig so existing config serialization
+    and API shapes stay unchanged while the rollout flag remains off by default.
+    """
+    raw = os.environ.get("FACE_SESSION_MATCH_CONSENSUS")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true"}
+
+
+def _eligible_for_session_match_consensus(
+        photo: "SessionPhotoResult",
+        peers: Sequence["SessionPhotoResult"],
+) -> bool:
+    if photo.match_status != "inconclusive":
+        return False
+    if photo.error_code not in ("", COS_INCONCLUSIVE_ZONE):
+        return False
+    if photo.quality_flags:
+        return False
+    if photo.cosine_score is None:
+        return False
+    if not (CONSENSUS_COS_MIN <= photo.cosine_score < PRODUCTION_COS_MATCH):
+        return False
+    if photo.is_outlier:
+        return False
+
+    match_peer_count = 0
+    mismatch_peer_count = 0
+    outlier_peer_count = 0
+    for peer in peers:
+        if peer.is_outlier:
+            outlier_peer_count += 1
+        if peer.match_status == "match":
+            match_peer_count += 1
+        elif peer.match_status == "mismatch":
+            mismatch_peer_count += 1
+
+    return (
+        match_peer_count >= CONSENSUS_MIN_MATCH_PEERS
+        and mismatch_peer_count == 0
+        and outlier_peer_count == 0
+    )
+
+
+def apply_session_match_consensus(photo_results: Sequence["SessionPhotoResult"]) -> int:
+    """Promote eligible per-photo inconclusive results to match.
+
+    This is a disabled-by-default production-shaped helper for later isolated
+    evaluation. It only mutates `match_status` on eligible photos and returns the
+    number of changed rows.
+    """
+    items = list(photo_results)
+    changed = 0
+    for index, photo in enumerate(items):
+        peers = items[:index] + items[index + 1:]
+        if not _eligible_for_session_match_consensus(photo, peers):
+            continue
+        photo.match_status = "match"
+        changed += 1
+    return changed
 
 
 @dataclass

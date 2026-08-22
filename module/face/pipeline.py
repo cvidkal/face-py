@@ -15,7 +15,6 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -23,7 +22,7 @@ import numpy as np
 
 from .clarity import compute_image_clarity_score
 from .content_gate import compute_content_score, is_photo_unusable
-from .detector import DetectedFace, FaceAligner, FaceDetector, largest_face
+from .detector import FaceAligner, FaceDetector, largest_face
 from .errors import (
     COS_INCONCLUSIVE_ZONE, DETECTION_LOW_CONFIDENCE, FACE_TOO_BLURRY, FACE_TOO_SMALL,
     FEATURE_EXTRACTION_FAILED, IMAGE_READ_FAILED, MISMATCH_WITHHELD_LOW_QUALITY,
@@ -33,7 +32,10 @@ from .errors import (
     msg_photo_unusable, msg_pose_excessive, msg_ref_image_read_failed,
 )
 from .pose_gate import compute_head_pose
-from .quality_gate import QualityGateConfig
+from .quality_gate import (
+    QualityGateConfig, apply_session_match_consensus,
+    session_match_consensus_enabled,
+)
 from .recognizer import (
     FaceRecognizer, classify_match, cosine_score, get_match_thresholds,
     is_same_person, l2_distance,
@@ -558,6 +560,8 @@ class FacePipeline:
             result.session_l2_to_ref = l2_v
             result.session_status = classify_match(cos_v, l2_v)
             result.reason = (f"Stage 2: prototype cos={cos_v:.3f} l2={l2_v:.3f}")
+            if session_match_consensus_enabled():
+                apply_session_match_consensus(result.photo_results)
             return self._finish_session(result, t0)
 
         except Exception as exc:
