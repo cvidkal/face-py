@@ -46,6 +46,7 @@ def _photo(
         error_code: str = "",
         quality_flags: list[str] | None = None,
         is_outlier: bool = False,
+        passes_gate: bool = True,
 ) -> SessionPhotoResult:
     return SessionPhotoResult(
         sequence_no=sequence_no,
@@ -54,6 +55,7 @@ def _photo(
         error_code=error_code,
         quality_flags=list(quality_flags or []),
         is_outlier=is_outlier,
+        passes_gate=passes_gate,
     )
 
 
@@ -238,6 +240,24 @@ class SessionMatchConsensusRuleTests(unittest.TestCase):
 
         self.assertEqual(changed, 0)
         self.assertEqual(candidate.match_status, "inconclusive")
+
+    def test_consensus_ignores_non_clean_match_peers(self) -> None:
+        candidate = _photo(sequence_no=1, cosine=0.32)
+        clean_match = _photo(sequence_no=2, status="match", cosine=0.40)
+        flagged_match = _photo(
+            sequence_no=3,
+            status="match",
+            cosine=0.45,
+            quality_flags=["pose_excessive"],
+            passes_gate=False,
+        )
+
+        changed = apply_session_match_consensus([candidate, clean_match, flagged_match])
+
+        self.assertEqual(changed, 0)
+        self.assertEqual(candidate.match_status, "inconclusive")
+        self.assertEqual(clean_match.match_status, "match")
+        self.assertEqual(flagged_match.match_status, "match")
 
     def test_consensus_rejects_candidate_outlier(self) -> None:
         candidate = _photo(sequence_no=1, cosine=0.32, is_outlier=True)

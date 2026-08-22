@@ -80,6 +80,8 @@ def _eligible_for_session_match_consensus(
         photo: "SessionPhotoResult",
         peers: Sequence["SessionPhotoResult"],
 ) -> bool:
+    if not photo.passes_gate:
+        return False
     if photo.match_status != "inconclusive":
         return False
     if photo.error_code not in ("", COS_INCONCLUSIVE_ZONE):
@@ -97,8 +99,11 @@ def _eligible_for_session_match_consensus(
     mismatch_peer_count = 0
     outlier_peer_count = 0
     for peer in peers:
+        if not peer.passes_gate or peer.quality_flags:
+            continue
         if peer.is_outlier:
             outlier_peer_count += 1
+            continue
         if peer.match_status == "match":
             match_peer_count += 1
         elif peer.match_status == "mismatch":
