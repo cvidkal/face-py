@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -1192,6 +1193,22 @@ class V2ArtifactAndCliTests(unittest.TestCase):
                 "synthetic_cross_student": 0.8,
             },
         )
+        self.assertNotIn("source_feedback_snapshot", manifest)
+
+    def test_public_artifact_redacts_snapshot_and_omits_snapshot_key(self) -> None:
+        self.result.source_feedback_snapshot = (
+            "2026-08-30T12:00:00+00:00:/private/raw-feedback/session-17"
+        )
+
+        manifest = write_v2_candidate_artifacts(
+            self.output_dir,
+            self.result,
+            seed=20260830,
+        )
+
+        encoded = json.dumps(manifest, sort_keys=True)
+        self.assertNotIn("source_feedback_snapshot", manifest)
+        self.assertNotIn(self.result.source_feedback_snapshot, encoded)
 
     def test_write_v2_candidate_artifacts_refuses_existing_output_path(self) -> None:
         self.output_dir.mkdir()
@@ -1225,6 +1242,40 @@ class V2ArtifactAndCliTests(unittest.TestCase):
         self.assertFalse(
             (failure_dirs[0] / "identity_domain_adapter.manifest.json").exists()
         )
+
+    def test_write_v2_candidate_artifacts_never_overwrites_racing_destination(self) -> None:
+        sentinel = self.output_dir / "sentinel.txt"
+
+        def create_racing_destination() -> None:
+            self.output_dir.mkdir(mode=0o700)
+            sentinel.write_text("keep-me", encoding="utf-8")
+            os.chmod(sentinel, 0o600)
+
+        with self.assertRaisesRegex(FileExistsError, "already exists"):
+            write_v2_candidate_artifacts(
+                self.output_dir,
+                self.result,
+                seed=20260830,
+                _before_publish=create_racing_destination,
+            )
+
+        self.assertTrue(self.output_dir.is_dir())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep-me")
+        self.assertFalse(
+            (self.output_dir / "identity_domain_adapter.manifest.json").exists()
+        )
+        failure_dirs = [
+            path
+            for path in self.root.iterdir()
+            if path.is_dir() and path not in {self.embedding_cache, self.output_dir}
+        ]
+        self.assertEqual(len(failure_dirs), 1)
+        failure_dir = failure_dirs[0]
+        self.assertEqual(failure_dir.stat().st_mode & 0o777, 0o700)
+        self.assertFalse((failure_dir / "identity_domain_adapter.manifest.json").exists())
+        evidence = failure_dir / "artifact-export-failure.json"
+        self.assertTrue(evidence.exists())
+        self.assertEqual(evidence.stat().st_mode & 0o777, 0o600)
 
     def test_cli_refuses_existing_output_directory(self) -> None:
         self.output_dir.mkdir()

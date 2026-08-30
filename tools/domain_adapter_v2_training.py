@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -11,7 +13,7 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import onnxruntime as ort
@@ -48,6 +50,9 @@ _MIN_VALIDATION_GROUPS = 1000
 _MAX_FOLD_EMPIRICAL_FAR = 0.005
 _MAX_POOLED_FAR_UPPER_95 = 0.01
 _MIN_THRESHOLD = 0.35
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = getattr(os, "AT_FDCWD", -100)
+_LIBC = ctypes.CDLL(None, use_errno=True)
 
 
 @dataclass(frozen=True)
@@ -401,6 +406,8 @@ def write_v2_candidate_artifacts(
     output_dir: Path,
     result: V2TrainingResult,
     seed: int,
+    *,
+    _before_publish: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     output_dir = Path(output_dir)
     if output_dir.exists():
@@ -424,7 +431,9 @@ def write_v2_candidate_artifacts(
             temporary_dir / "identity_domain_adapter.manifest.json",
             manifest,
         )
-        os.replace(temporary_dir, output_dir)
+        if _before_publish is not None:
+            _before_publish()
+        _publish_directory_no_replace(temporary_dir, output_dir)
         os.chmod(output_dir, 0o700)
         for path in output_dir.iterdir():
             os.chmod(path, 0o600)
@@ -516,7 +525,6 @@ def _v2_runtime_manifest(
         "onnx_file": onnx_file,
         "onnx_sha256": onnx_sha256,
         "onnx_parity_max_abs_error": onnx_parity_max_abs_error,
-        "source_feedback_snapshot": result.source_feedback_snapshot,
         "source_dataset_sha256": result.dataset_digest,
         "source_code_revision": _source_revision(),
         "split_seed": result.split_seed,
@@ -566,6 +574,36 @@ def _v2_runtime_manifest(
             "canonical_dataset_digest": result.dataset_digest,
         },
     }
+
+
+def _publish_directory_no_replace(source_dir: Path, target_dir: Path) -> None:
+    renameat2 = getattr(_LIBC, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace publish is unavailable on this platform")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    source_path = os.fsencode(source_dir)
+    target_path = os.fsencode(target_dir)
+    if renameat2(_AT_FDCWD, source_path, _AT_FDCWD, target_path, _RENAME_NOREPLACE) == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(f"output directory already exists: {target_dir}")
+    if error in {
+        errno.ENOSYS,
+        errno.EPERM,
+        errno.EINVAL,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }:
+        raise RuntimeError("atomic no-replace publish is unavailable on this platform")
+    raise OSError(error, os.strerror(error), str(target_dir))
 
 
 def _public_fold_summaries(
@@ -634,6 +672,7 @@ def _preserve_failure_evidence(path: Path, exc: Exception) -> None:
     if not path.exists():
         return
     try:
+        (path / "identity_domain_adapter.manifest.json").unlink(missing_ok=True)
         for child in path.iterdir():
             if child.is_file():
                 os.chmod(child, 0o600)
