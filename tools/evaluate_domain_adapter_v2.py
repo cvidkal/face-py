@@ -89,6 +89,7 @@ def evaluate_v2_candidate(
     dataset_manifest: Path,
     benchmark_manifest: Path,
     dataset_role: Literal["engineering", "release"],
+    historical_manifest: Path | None = None,
     cohort_registry: Path | None = None,
     *,
     pipeline_factory: Any | None = None,
@@ -97,8 +98,12 @@ def evaluate_v2_candidate(
     candidate_dir = Path(candidate_dir)
     dataset_manifest = Path(dataset_manifest)
     benchmark_manifest = Path(benchmark_manifest)
+    if dataset_role == "release" and historical_manifest is None:
+        raise ValueError("release evaluation requires historical_manifest")
     if dataset_role == "release" and cohort_registry is None:
         raise ValueError("release evaluation requires cohort_registry")
+    if dataset_role == "engineering" and historical_manifest is not None:
+        raise ValueError("engineering evaluation must not receive historical_manifest")
     if dataset_role == "engineering" and cohort_registry is not None:
         raise ValueError("engineering evaluation must not receive cohort_registry")
 
@@ -174,6 +179,7 @@ def evaluate_v2_candidate(
         dataset=dataset,
         dataset_manifest=dataset_manifest,
         dataset_role=dataset_role,
+        historical_manifest=Path(historical_manifest) if historical_manifest is not None else None,
         cohort_registry=Path(cohort_registry) if cohort_registry is not None else None,
         candidate_training_digest=str(artifact["source_dataset_sha256"]),
         held_out=held_out,
@@ -189,7 +195,10 @@ def evaluate_v2_candidate(
         dataset_role == "release"
         and provenance["release_manifest_role_matches"]
         and provenance["historical_digest_matches_candidate"]
+        and provenance["historical_manifest_matches_release"]
+        and provenance["historical_student_overlap_free"]
         and provenance["registry_entry_matches"]
+        and provenance["registry_hashes_unique_to_current"]
         and provenance["release_time_bounds_valid"]
         and provenance["release_excluded_overlap_ok"]
         and provenance["release_sufficiency_exact"]
@@ -223,7 +232,16 @@ def evaluate_v2_candidate(
             "historical_digest_matches_candidate": provenance[
                 "historical_digest_matches_candidate"
             ],
+            "historical_manifest_matches_release": provenance[
+                "historical_manifest_matches_release"
+            ],
+            "historical_student_overlap_free": provenance[
+                "historical_student_overlap_free"
+            ],
             "registry_entry_matches": provenance["registry_entry_matches"],
+            "registry_hashes_unique_to_current": provenance[
+                "registry_hashes_unique_to_current"
+            ],
             "release_time_bounds_valid": provenance["release_time_bounds_valid"],
             "release_excluded_overlap_ok": provenance["release_excluded_overlap_ok"],
             "release_sufficiency_exact": provenance["release_sufficiency_exact"],
@@ -413,6 +431,7 @@ def _provenance_report(
     dataset: dict[str, Any],
     dataset_manifest: Path,
     dataset_role: str,
+    historical_manifest: Path | None,
     cohort_registry: Path | None,
     candidate_training_digest: str,
     held_out: list[Any],
@@ -422,30 +441,49 @@ def _provenance_report(
         _file_sha256(dataset_manifest) == ENGINEERING_DATASET_FILE_SHA256
     )
     release_manifest_role_matches = dataset.get("dataset_role") == "release"
-    historical_digest_matches_candidate = (
-        str(dataset.get("historical_manifest_digest", "")) == candidate_training_digest
-    )
-    release_time_bounds_valid = _release_time_bounds_valid(dataset)
-    release_excluded_overlap_ok = (
-        int(
-            (((dataset.get("counts") or {}).get("excluded_by_reason") or {}).get(
-                "seen_student_overlap", 0
-            ))
+    historical_digest_matches_candidate = False
+    historical_manifest_matches_release = False
+    historical_student_overlap_free = False
+    excluded_hashes: set[str] = set()
+    current_hashes = _current_cohort_student_hashes(dataset)
+    if dataset_role == "release" and historical_manifest is not None:
+        historical = _load_json_object(historical_manifest, "historical manifest")
+        historical_digest = _canonical_sha256(historical)
+        historical_digest_matches_candidate = historical_digest == candidate_training_digest
+        historical_manifest_matches_release = (
+            str(dataset.get("historical_manifest_digest", "")) == historical_digest
         )
-        == 0
+        historical_hashes = _historical_student_hashes(historical)
+        historical_student_overlap_free = not bool(current_hashes & historical_hashes)
+        excluded_hashes |= historical_hashes
+    release_time_bounds_valid = _release_time_bounds_valid(dataset)
+    registry_entry_matches = False
+    registry_hashes_unique_to_current = False
+    if dataset_role == "release" and cohort_registry is not None:
+        registry_entry_matches, registry_hashes_unique_to_current, other_registry_hashes = (
+            _registry_checks(dataset, cohort_registry)
+        )
+        excluded_hashes |= other_registry_hashes
+    release_excluded_overlap_ok = (
+        historical_student_overlap_free and registry_hashes_unique_to_current
+        if dataset_role == "release"
+        else True
     )
-    cohort_sufficiency = _cohort_sufficiency(dataset_role, held_out)
-    registry_entry_matches = (
-        _registry_entry_matches(dataset, cohort_registry)
-        if dataset_role == "release" and cohort_registry is not None
-        else False
+    cohort_sufficiency = _cohort_sufficiency(
+        dataset_role,
+        held_out,
+        excluded_hashes=excluded_hashes,
+        overlap_or_anomaly=not release_excluded_overlap_ok,
     )
     return {
         "engineering_manifest_sha256_pinned": engineering_manifest_sha256_pinned,
         "engineering_dataset_role_absent": engineering_dataset_role_absent,
         "release_manifest_role_matches": release_manifest_role_matches,
         "historical_digest_matches_candidate": historical_digest_matches_candidate,
+        "historical_manifest_matches_release": historical_manifest_matches_release,
+        "historical_student_overlap_free": historical_student_overlap_free,
         "registry_entry_matches": registry_entry_matches,
+        "registry_hashes_unique_to_current": registry_hashes_unique_to_current,
         "release_time_bounds_valid": release_time_bounds_valid,
         "release_excluded_overlap_ok": release_excluded_overlap_ok,
         "release_sufficiency_exact": cohort_sufficiency["exact_minima"],
@@ -457,7 +495,13 @@ def _provenance_report(
     }
 
 
-def _cohort_sufficiency(dataset_role: str, held_out: list[Any]) -> dict[str, Any]:
+def _cohort_sufficiency(
+    dataset_role: str,
+    held_out: list[Any],
+    *,
+    excluded_hashes: set[str],
+    overlap_or_anomaly: bool,
+) -> dict[str, Any]:
     if dataset_role != "release":
         return {
             "status": "not_applicable",
@@ -466,19 +510,9 @@ def _cohort_sufficiency(dataset_role: str, held_out: list[Any]) -> dict[str, Any
         }
 
     eligible_sessions = [
-        SessionEmbedding(
-            student_id=item.student_id,
-            session_id=item.session_id,
-            split="test",
-            label="match",
-            ref_embedding=np.asarray(item.ref_embedding, dtype=np.float32),
-            session_prototype=np.asarray(item.session_prototype, dtype=np.float32),
-        )
-        for item in held_out
-        if item.truth == "match"
-        and item.adapter_applied
-        and item.ref_embedding is not None
-        and item.session_prototype is not None
+        session
+        for session in _deduped_eligible_release_sessions(held_out)
+        if _student_hash(session.student_id) not in excluded_hashes
     ]
     synthetic_pairs = 0
     if len({session.student_id for session in eligible_sessions}) >= 2:
@@ -488,7 +522,7 @@ def _cohort_sufficiency(dataset_role: str, held_out: list[Any]) -> dict[str, Any
             for category in pair_set.negative_categories
         )
     summary = {
-        "unseen_students": len({item.student_id for item in held_out}),
+        "unseen_students": len({session.student_id for session in eligible_sessions}),
         "minimum_unseen_students": MIN_RELEASE_UNSEEN_STUDENTS,
         "adapter_eligible_truth_match_sessions": len(eligible_sessions),
         "minimum_adapter_eligible_truth_match_sessions": MIN_RELEASE_ELIGIBLE_MATCH_SESSIONS,
@@ -510,11 +544,120 @@ def _cohort_sufficiency(dataset_role: str, held_out: list[Any]) -> dict[str, Any
             >= MIN_RELEASE_ELIGIBLE_MATCH_SESSIONS
             and summary["ordered_cross_student_session_pairs"]
             >= MIN_RELEASE_ORDERED_CROSS_STUDENT_PAIRS
+            and not overlap_or_anomaly
             else "insufficient_data"
         ),
         "exact_minima": exact_minima,
         "summary": summary,
     }
+
+
+def _deduped_eligible_release_sessions(held_out: list[Any]) -> tuple[SessionEmbedding, ...]:
+    sessions: dict[tuple[str, str], tuple[tuple[Any, ...], SessionEmbedding]] = {}
+    for item in held_out:
+        if (
+            item.truth != "match"
+            or not item.adapter_applied
+            or item.ref_embedding is None
+            or item.session_prototype is None
+        ):
+            continue
+        key = (item.student_id, item.session_id)
+        session = SessionEmbedding(
+            student_id=item.student_id,
+            session_id=item.session_id,
+            split="test",
+            label="match",
+            ref_embedding=np.asarray(item.ref_embedding, dtype=np.float32),
+            session_prototype=np.asarray(item.session_prototype, dtype=np.float32),
+        )
+        signature = (
+            item.truth,
+            item.raw_status,
+            item.adapted_status,
+            item.internal_consistency,
+            np.asarray(item.ref_embedding, dtype=np.float32).tobytes(),
+            np.asarray(item.session_prototype, dtype=np.float32).tobytes(),
+        )
+        previous = sessions.get(key)
+        if previous is None:
+            sessions[key] = (signature, session)
+            continue
+        if previous[0] != signature:
+            raise ValueError(
+                "conflicting duplicate release observation "
+                f"for {item.student_id}/{item.session_id}"
+            )
+    return tuple(item[1] for item in sessions.values())
+
+
+def _current_cohort_student_hashes(dataset: dict[str, Any]) -> set[str]:
+    rows = dataset.get("evaluation_sessions", [])
+    if not isinstance(rows, list):
+        return set()
+    return {
+        _student_hash(str(row.get("student_id", "")))
+        for row in rows
+        if isinstance(row, dict) and str(row.get("student_id", ""))
+    }
+
+
+def _historical_student_hashes(historical: dict[str, Any]) -> set[str]:
+    if historical.get("schema_version") != 1:
+        raise ValueError("historical manifest schema_version must be 1")
+    hashes: set[str] = set()
+    for key in ("sessions", "evaluation_sessions"):
+        rows = historical.get(key)
+        if not isinstance(rows, list):
+            raise ValueError(f"historical manifest {key} must be a list")
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError(f"historical manifest {key} rows must be objects")
+            student_id = str(row.get("student_id", ""))
+            if not student_id:
+                raise ValueError(f"historical manifest {key} rows require student_id")
+            hashes.add(_student_hash(student_id))
+    return hashes
+
+
+def _registry_checks(
+    dataset: dict[str, Any],
+    cohort_registry: Path,
+) -> tuple[bool, bool, set[str]]:
+    registry = _load_json_object(cohort_registry, "cohort registry")
+    if registry.get("schema_version") != RELEASE_REGISTRY_SCHEMA_VERSION:
+        raise ValueError("cohort registry schema_version must be 1")
+    if registry.get("hash_scheme") != RELEASE_REGISTRY_HASH_SCHEME:
+        raise ValueError("cohort registry hash_scheme is invalid")
+    cohorts = registry.get("cohorts")
+    if not isinstance(cohorts, list):
+        raise ValueError("cohort registry cohorts must be a list")
+
+    expected_hashes = sorted(_current_cohort_student_hashes(dataset))
+    current_exact = False
+    current_match_count = 0
+    other_hashes: set[str] = set()
+    reused = False
+    for cohort in cohorts:
+        if not isinstance(cohort, dict):
+            raise ValueError("cohort registry cohort entries must be objects")
+        cohort_hashes_raw = cohort.get("student_hashes")
+        if not isinstance(cohort_hashes_raw, list):
+            raise ValueError("cohort registry cohort student_hashes must be a list")
+        cohort_hashes = {str(value) for value in cohort_hashes_raw}
+        is_current = (
+            cohort.get("cohort_id") == dataset.get("cohort_id")
+            and cohort.get("after") == dataset.get("after")
+            and cohort.get("through") == dataset.get("through")
+        )
+        if is_current:
+            current_match_count += 1
+            current_exact = sorted(cohort_hashes) == expected_hashes
+        else:
+            if cohort_hashes & set(expected_hashes):
+                reused = True
+            other_hashes |= cohort_hashes
+    return current_match_count == 1 and current_exact, not reused, other_hashes
 
 
 def _release_time_bounds_valid(dataset: dict[str, Any]) -> bool:
@@ -622,6 +765,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate-dir", type=Path, required=True)
     parser.add_argument("--dataset-manifest", type=Path, required=True)
+    parser.add_argument("--historical-manifest", type=Path)
     parser.add_argument("--benchmark-manifest", type=Path, required=True)
     parser.add_argument(
         "--dataset-role",
@@ -638,8 +782,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error(f"output already exists: {args.output}")
+    if args.dataset_role == "release" and args.historical_manifest is None:
+        parser.error("--historical-manifest is required for release")
     if args.dataset_role == "release" and args.cohort_registry is None:
         parser.error("--cohort-registry is required for release")
+    if args.dataset_role == "engineering" and args.historical_manifest is not None:
+        parser.error("--historical-manifest must not be set for engineering")
     if args.dataset_role == "engineering" and args.cohort_registry is not None:
         parser.error("--cohort-registry must not be set for engineering")
 
@@ -649,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
             args.dataset_manifest,
             args.benchmark_manifest,
             dataset_role=args.dataset_role,
+            historical_manifest=args.historical_manifest,
             cohort_registry=args.cohort_registry,
         )
     except Exception as exc:

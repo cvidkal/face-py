@@ -50,6 +50,33 @@ def _trusted_benchmark_patch(benchmark_manifest: Path):
     )
 
 
+def _release_relative_metrics_patch():
+    return patch(
+        "tools.evaluate_domain_adapter_v2._relative_metrics",
+        return_value={
+            "raw_frozen_threshold": 0.35,
+            "adapted_frozen_threshold": 0.40,
+            "raw_far": 0.0,
+            "adapted_far": 0.0,
+            "far_delta": 0.0,
+            "raw_recall_at_1pct_budget": 0.80,
+            "adapted_recall_at_1pct_budget": 0.85,
+            "recall_lift": 0.05,
+            "raw_true_matches": 80,
+            "adapted_true_matches": 85,
+            "true_match_delta": 5,
+            "same_threshold_0_35": {
+                "threshold": 0.35,
+                "raw_recall": 0.80,
+                "adapted_recall": 0.85,
+                "recall_delta": 0.05,
+            },
+            "positive_observations": 100,
+            "negative_observations": 9800,
+        },
+    )
+
+
 class AbsoluteGateTests(unittest.TestCase):
     def test_accepts_exact_absolute_boundaries(self) -> None:
         metrics = {
@@ -137,6 +164,7 @@ class EvaluateV2CandidateTests(unittest.TestCase):
                         engineering_manifest,
                         benchmark_manifest,
                         dataset_role="engineering",
+                        historical_manifest=None,
                         pipeline_factory=lambda: fixture.pipeline,
                         inference_session_factory=lambda _path: fixture.inference,
                     )
@@ -167,36 +195,14 @@ class EvaluateV2CandidateTests(unittest.TestCase):
             )
             registry_path = fixture.write_registry(release_manifest)
 
-            with patch(
-                "tools.evaluate_domain_adapter_v2._relative_metrics",
-                return_value={
-                    "raw_frozen_threshold": 0.35,
-                    "adapted_frozen_threshold": 0.40,
-                    "raw_far": 0.0,
-                    "adapted_far": 0.0,
-                    "far_delta": 0.0,
-                    "raw_recall_at_1pct_budget": 0.80,
-                    "adapted_recall_at_1pct_budget": 0.85,
-                    "recall_lift": 0.05,
-                    "raw_true_matches": 80,
-                    "adapted_true_matches": 85,
-                    "true_match_delta": 5,
-                    "same_threshold_0_35": {
-                        "threshold": 0.35,
-                        "raw_recall": 0.80,
-                        "adapted_recall": 0.85,
-                        "recall_delta": 0.05,
-                    },
-                    "positive_observations": 100,
-                    "negative_observations": 9800,
-                },
-            ):
+            with _release_relative_metrics_patch():
                 with _trusted_benchmark_patch(benchmark_manifest):
                     report = evaluate_v2_candidate(
                         candidate_dir,
                         release_manifest,
                         benchmark_manifest,
                         dataset_role="release",
+                        historical_manifest=fixture.historical_manifest,
                         cohort_registry=registry_path,
                         pipeline_factory=lambda: fixture.pipeline,
                         inference_session_factory=lambda _path: fixture.inference,
@@ -231,6 +237,7 @@ class EvaluateV2CandidateTests(unittest.TestCase):
                     release_manifest,
                     benchmark_manifest,
                     dataset_role="release",
+                    historical_manifest=fixture.historical_manifest,
                     cohort_registry=registry_path,
                     pipeline_factory=lambda: fixture.pipeline,
                     inference_session_factory=lambda _path: fixture.inference,
@@ -270,6 +277,7 @@ class EvaluateV2CandidateTests(unittest.TestCase):
                             engineering_manifest,
                             replacement_manifest,
                             dataset_role="engineering",
+                            historical_manifest=None,
                             pipeline_factory=lambda: fixture.pipeline,
                             inference_session_factory=lambda _path: fixture.inference,
                         )
@@ -299,36 +307,14 @@ class EvaluateV2CandidateTests(unittest.TestCase):
             release_manifest.write_text(json.dumps(manifest), encoding="utf-8")
             registry_path = fixture.write_registry(release_manifest)
 
-            with patch(
-                "tools.evaluate_domain_adapter_v2._relative_metrics",
-                return_value={
-                    "raw_frozen_threshold": 0.35,
-                    "adapted_frozen_threshold": 0.40,
-                    "raw_far": 0.0,
-                    "adapted_far": 0.0,
-                    "far_delta": 0.0,
-                    "raw_recall_at_1pct_budget": 0.80,
-                    "adapted_recall_at_1pct_budget": 0.85,
-                    "recall_lift": 0.05,
-                    "raw_true_matches": 80,
-                    "adapted_true_matches": 85,
-                    "true_match_delta": 5,
-                    "same_threshold_0_35": {
-                        "threshold": 0.35,
-                        "raw_recall": 0.80,
-                        "adapted_recall": 0.85,
-                        "recall_delta": 0.05,
-                    },
-                    "positive_observations": 100,
-                    "negative_observations": 9800,
-                },
-            ):
+            with _release_relative_metrics_patch():
                 with _trusted_benchmark_patch(benchmark_manifest):
                     report = evaluate_v2_candidate(
                         candidate_dir,
                         release_manifest,
                         benchmark_manifest,
                         dataset_role="release",
+                        historical_manifest=fixture.historical_manifest,
                         cohort_registry=registry_path,
                         pipeline_factory=lambda: fixture.pipeline,
                         inference_session_factory=lambda _path: fixture.inference,
@@ -342,6 +328,190 @@ class EvaluateV2CandidateTests(unittest.TestCase):
             self.assertEqual(
                 report["cohort_sufficiency"]["ordered_cross_student_session_pairs"], 0
             )
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_release_duplicate_eligible_rows_count_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            release_manifest = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=50,
+                sessions_per_student=1,
+                duplicate_copies=2,
+            )
+            registry_path = fixture.write_registry(release_manifest)
+
+            with _release_relative_metrics_patch():
+                with _trusted_benchmark_patch(benchmark_manifest):
+                    report = evaluate_v2_candidate(
+                        candidate_dir,
+                        release_manifest,
+                        benchmark_manifest,
+                        dataset_role="release",
+                        historical_manifest=fixture.historical_manifest,
+                        cohort_registry=registry_path,
+                        pipeline_factory=lambda: fixture.pipeline,
+                        inference_session_factory=lambda _path: fixture.inference,
+                    )
+
+            self.assertEqual(report["cohort_sufficiency"]["unseen_students"], 50)
+            self.assertEqual(
+                report["cohort_sufficiency"]["adapter_eligible_truth_match_sessions"], 50
+            )
+            self.assertEqual(
+                report["cohort_sufficiency"]["ordered_cross_student_session_pairs"], 2450
+            )
+            self.assertEqual(report["cohort_status"], "insufficient_data")
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_mismatch_only_students_do_not_count_toward_unseen_minimum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            release_manifest = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=50,
+                sessions_per_student=1,
+            )
+            manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+            for row in manifest["evaluation_sessions"][:48]:
+                row["label"] = "mismatch"
+            release_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+            registry_path = fixture.write_registry(release_manifest)
+
+            with _release_relative_metrics_patch():
+                with _trusted_benchmark_patch(benchmark_manifest):
+                    report = evaluate_v2_candidate(
+                        candidate_dir,
+                        release_manifest,
+                        benchmark_manifest,
+                        dataset_role="release",
+                        historical_manifest=fixture.historical_manifest,
+                        cohort_registry=registry_path,
+                        pipeline_factory=lambda: fixture.pipeline,
+                        inference_session_factory=lambda _path: fixture.inference,
+                    )
+
+            self.assertEqual(report["cohort_sufficiency"]["unseen_students"], 2)
+            self.assertEqual(
+                report["cohort_sufficiency"]["adapter_eligible_truth_match_sessions"], 2
+            )
+            self.assertEqual(
+                report["cohort_sufficiency"]["ordered_cross_student_session_pairs"], 2
+            )
+            self.assertEqual(report["cohort_status"], "insufficient_data")
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_release_requires_historical_manifest_only_for_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            release_manifest = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=1,
+                sessions_per_student=1,
+            )
+            registry_path = fixture.write_registry(release_manifest)
+
+            with _trusted_benchmark_patch(benchmark_manifest):
+                with self.assertRaisesRegex(ValueError, "release evaluation requires historical_manifest"):
+                    evaluate_v2_candidate(
+                        candidate_dir,
+                        release_manifest,
+                        benchmark_manifest,
+                        dataset_role="release",
+                        historical_manifest=None,
+                        cohort_registry=registry_path,
+                        pipeline_factory=lambda: fixture.pipeline,
+                        inference_session_factory=lambda _path: fixture.inference,
+                    )
+                with self.assertRaisesRegex(ValueError, "engineering evaluation must not receive historical_manifest"):
+                    evaluate_v2_candidate(
+                        candidate_dir,
+                        engineering_manifest,
+                        benchmark_manifest,
+                        dataset_role="engineering",
+                        historical_manifest=fixture.historical_manifest,
+                        pipeline_factory=lambda: fixture.pipeline,
+                        inference_session_factory=lambda _path: fixture.inference,
+                    )
+
+    def test_release_rejects_historical_student_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            release_manifest = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=50,
+                sessions_per_student=2,
+            )
+            manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+            manifest["evaluation_sessions"][0]["student_id"] = "eng-student-000"
+            release_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+            registry_path = fixture.write_registry(release_manifest)
+
+            with _release_relative_metrics_patch():
+                with _trusted_benchmark_patch(benchmark_manifest):
+                    report = evaluate_v2_candidate(
+                        candidate_dir,
+                        release_manifest,
+                        benchmark_manifest,
+                        dataset_role="release",
+                        historical_manifest=fixture.historical_manifest,
+                        cohort_registry=registry_path,
+                        pipeline_factory=lambda: fixture.pipeline,
+                        inference_session_factory=lambda _path: fixture.inference,
+                    )
+
+            self.assertFalse(report["provenance"]["historical_student_overlap_free"])
+            self.assertEqual(report["cohort_status"], "insufficient_data")
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_release_rejects_current_hash_reused_in_earlier_registry_cohort(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            release_manifest = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=50,
+                sessions_per_student=2,
+            )
+            registry_path = fixture.write_registry(
+                release_manifest,
+                extra_prior_hashes=[_student_hash("release-student-000")],
+            )
+
+            with _release_relative_metrics_patch():
+                with _trusted_benchmark_patch(benchmark_manifest):
+                    report = evaluate_v2_candidate(
+                        candidate_dir,
+                        release_manifest,
+                        benchmark_manifest,
+                        dataset_role="release",
+                        historical_manifest=fixture.historical_manifest,
+                        cohort_registry=registry_path,
+                        pipeline_factory=lambda: fixture.pipeline,
+                        inference_session_factory=lambda _path: fixture.inference,
+                    )
+
+            self.assertFalse(report["provenance"]["registry_hashes_unique_to_current"])
+            self.assertEqual(report["cohort_status"], "insufficient_data")
             self.assertFalse(report["release_gate_passed"])
 
     def test_report_never_leaks_raw_identifiers_paths_or_group_ids(self) -> None:
@@ -362,6 +532,7 @@ class EvaluateV2CandidateTests(unittest.TestCase):
                         engineering_manifest,
                         benchmark_manifest,
                         dataset_role="engineering",
+                        historical_manifest=None,
                         pipeline_factory=lambda: fixture.pipeline,
                         inference_session_factory=lambda _path: fixture.inference,
                     )
@@ -397,6 +568,8 @@ class EvaluateV2CliTests(unittest.TestCase):
                             str(candidate_dir),
                             "--dataset-manifest",
                             str(release_manifest),
+                            "--historical-manifest",
+                            str(fixture.historical_manifest),
                             "--benchmark-manifest",
                             str(benchmark_manifest),
                             "--dataset-role",
@@ -408,6 +581,44 @@ class EvaluateV2CliTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.code, 2)
             self.assertIn("--cohort-registry is required", stderr.getvalue())
+            self.assertFalse(output.exists())
+
+    def test_cli_requires_historical_manifest_for_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            release_manifest = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=1,
+                sessions_per_student=1,
+            )
+            registry_path = fixture.write_registry(release_manifest)
+            output = root / "release-report.json"
+
+            with redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    evaluation_main(
+                        [
+                            "--candidate-dir",
+                            str(candidate_dir),
+                            "--dataset-manifest",
+                            str(release_manifest),
+                            "--benchmark-manifest",
+                            str(benchmark_manifest),
+                            "--dataset-role",
+                            "release",
+                            "--cohort-registry",
+                            str(registry_path),
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("--historical-manifest is required", stderr.getvalue())
             self.assertFalse(output.exists())
 
     def test_cli_forbids_cohort_registry_for_engineering(self) -> None:
@@ -439,6 +650,38 @@ class EvaluateV2CliTests(unittest.TestCase):
                             "engineering",
                             "--cohort-registry",
                             str(registry_path),
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("must not be set for engineering", stderr.getvalue())
+            self.assertFalse(output.exists())
+
+    def test_cli_forbids_historical_manifest_for_engineering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            output = root / "engineering-report.json"
+
+            with redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    evaluation_main(
+                        [
+                            "--candidate-dir",
+                            str(candidate_dir),
+                            "--dataset-manifest",
+                            str(engineering_manifest),
+                            "--historical-manifest",
+                            str(fixture.historical_manifest),
+                            "--benchmark-manifest",
+                            str(benchmark_manifest),
+                            "--dataset-role",
+                            "engineering",
                             "--output",
                             str(output),
                         ]
@@ -519,6 +762,7 @@ class _V2Fixture:
         self.pipeline = _EvaluationPipeline()
         self.inference = _BoostingAdapterSession()
         self._marker = 1
+        self.historical_manifest = self.root / "historical-manifest.json"
 
     def build_engineering_fixture(self) -> tuple[Path, Path, Path]:
         candidate_dir = self.root / "candidate"
@@ -527,6 +771,7 @@ class _V2Fixture:
         benchmark_manifest = self._build_benchmark_manifest(dimension=1024)
         dataset = self._engineering_manifest(dimension=1024)
         engineering_manifest.write_text(json.dumps(dataset), encoding="utf-8")
+        self.historical_manifest.write_text(json.dumps(dataset), encoding="utf-8")
         self._write_candidate_manifest(
             candidate_dir,
             training_digest=_canonical_sha256(dataset),
@@ -542,6 +787,7 @@ class _V2Fixture:
         engineering_manifest: Path,
         student_count: int,
         sessions_per_student: int,
+        duplicate_copies: int = 1,
     ) -> Path:
         manifest = json.loads(engineering_manifest.read_text(encoding="utf-8"))
         historical_digest = _canonical_sha256(manifest)
@@ -549,6 +795,7 @@ class _V2Fixture:
             dimension=1024,
             student_count=student_count,
             sessions_per_student=sessions_per_student,
+            duplicate_copies=duplicate_copies,
         )
         eligible_sessions = len(evaluation_sessions)
         unseen_students = student_count
@@ -601,12 +848,30 @@ class _V2Fixture:
         path.write_text(json.dumps(release_manifest), encoding="utf-8")
         return path
 
-    def write_registry(self, release_manifest: Path) -> Path:
+    def write_registry(
+        self,
+        release_manifest: Path,
+        *,
+        extra_prior_hashes: list[str] | None = None,
+    ) -> Path:
         manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+        prior_hashes = list(extra_prior_hashes or [])
         registry = {
             "schema_version": 1,
             "hash_scheme": "sha256-domain-v1",
-            "cohorts": [
+            "cohorts": (
+                [
+                    {
+                        "cohort_id": "release-20260829T000000Z-20260830T050122Z",
+                        "after": "2026-08-29T00:00:00+00:00",
+                        "through": "2026-08-30T05:01:22+00:00",
+                        "student_hashes": prior_hashes,
+                    }
+                ]
+                if prior_hashes
+                else []
+            )
+            + [
                 {
                     "cohort_id": manifest["cohort_id"],
                     "after": manifest["after"],
@@ -658,6 +923,7 @@ class _V2Fixture:
         sessions_per_student: int,
         student_prefix: str = "release-student",
         session_prefix: str = "release-session",
+        duplicate_copies: int = 1,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
         next_axis = 0
@@ -686,24 +952,23 @@ class _V2Fixture:
                     ref_embedding=ref,
                     photo_embedding=photo,
                 )
-                rows.append(
-                    {
-                        "student_id": student_id,
-                        "session_id": session_id,
-                        "split": "test",
-                        "label": "match",
-                        "ref_image_path": str(ref_path),
-                        "photos": [
-                            {
-                                "sequence_no": 1,
-                                "photo_type": "sign_in",
-                                "image_path": str(photo_path),
-                            }
-                        ],
-                        "training_exclusion_reasons": ["test_split"],
-                        "source_feedback_ids": [f"feedback-{session_id}"],
-                    }
-                )
+                row = {
+                    "student_id": student_id,
+                    "session_id": session_id,
+                    "split": "test",
+                    "label": "match",
+                    "ref_image_path": str(ref_path),
+                    "photos": [
+                        {
+                            "sequence_no": 1,
+                            "photo_type": "sign_in",
+                            "image_path": str(photo_path),
+                        }
+                    ],
+                    "training_exclusion_reasons": ["test_split"],
+                    "source_feedback_ids": [f"feedback-{session_id}"],
+                }
+                rows.extend(json.loads(json.dumps(row)) for _ in range(duplicate_copies))
                 next_axis += 1
         return rows
 
