@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""Evaluate an identity domain adapter against held-out release gates."""
+"""Evaluate an identity domain adapter against held-out release gates.
+
+The benchmark archive is fail-closed around ``benchmark-manifest.json`` schema 1::
+
+    {
+      "schema_version": 1,
+      "benchmark_id": "customer-identity-40-v1",
+      "known_impostor": {"student_id": "...", "session_id": "..."},
+      "sessions": [{
+        "student_id": "...", "session_id": "...",
+        "record_path": "<student_id>/<session_id>/record.json",
+        "record_sha256": "<sha256>", "truth": "match|mismatch"
+      }],
+      "manifest_sha256": "<canonical sha256 of all preceding fields>"
+    }
+
+There must be exactly 40 entries and archive records, with no unlisted paths. The one
+``mismatch`` entry must be the named known impersonation. Record bytes and record identities
+must match their entries before any face replay begins.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +48,7 @@ from module.face.session_consistency import session_prototype  # noqa: E402
 
 
 ARTIFACT_MANIFEST = "identity_domain_adapter.manifest.json"
+BENCHMARK_MANIFEST = "benchmark-manifest.json"
 KNOWN_IMPOSTOR_STUDENT_ID = "S177509932310186"
 EXPECTED_BENCHMARK_SESSIONS = 40
 _PREDICTIONS = ("match", "mismatch", "inconclusive")
@@ -361,16 +381,123 @@ def _cross_student_metrics(
     }
 
 
-def _load_benchmark_rows(benchmark_archive: Path) -> list[dict[str, Any]]:
-    record_paths = sorted(benchmark_archive.glob("*/*/record.json"))
-    if len(record_paths) != EXPECTED_BENCHMARK_SESSIONS:
+def _load_benchmark_rows(
+    benchmark_archive: Path,
+) -> tuple[list[dict[str, Any]], dict[str, str | int]]:
+    manifest_path = benchmark_archive / BENCHMARK_MANIFEST
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except FileNotFoundError as exc:
+        raise ValueError(f"benchmark manifest does not exist: {manifest_path}") from exc
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"benchmark manifest is unreadable: {manifest_path}: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("benchmark manifest root must be an object")
+    if manifest.get("schema_version") != 1:
+        raise ValueError("benchmark manifest schema_version must be 1")
+    benchmark_id = manifest.get("benchmark_id")
+    if not isinstance(benchmark_id, str) or not benchmark_id:
+        raise ValueError("benchmark manifest benchmark_id must be non-empty")
+    declared_manifest_sha = manifest.get("manifest_sha256")
+    manifest_payload = {
+        key: value for key, value in manifest.items() if key != "manifest_sha256"
+    }
+    actual_manifest_sha = _canonical_sha256(manifest_payload)
+    if (
+        not isinstance(declared_manifest_sha, str)
+        or declared_manifest_sha != actual_manifest_sha
+    ):
+        raise ValueError("benchmark manifest SHA256 does not match its payload")
+
+    entries = manifest.get("sessions")
+    if not isinstance(entries, list):
+        raise ValueError("benchmark manifest sessions must be a list")
+    if len(entries) != EXPECTED_BENCHMARK_SESSIONS:
         raise ValueError(
-            "benchmark archive must contain exactly "
-            f"{EXPECTED_BENCHMARK_SESSIONS} sessions; found {len(record_paths)}"
+            "benchmark manifest must contain exactly "
+            f"{EXPECTED_BENCHMARK_SESSIONS} sessions; found {len(entries)}"
         )
+
+    known = manifest.get("known_impostor")
+    if not isinstance(known, dict):
+        raise ValueError("benchmark manifest known_impostor must be an object")
+    known_identity = (
+        str(known.get("student_id", "")),
+        str(known.get("session_id", "")),
+    )
+    if known_identity[0] != KNOWN_IMPOSTOR_STUDENT_ID or not known_identity[1]:
+        raise ValueError("benchmark manifest known_impostor identity is invalid")
+
+    normalized_entries: list[dict[str, str]] = []
+    expected_paths: set[str] = set()
+    expected_identities: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("benchmark manifest session entries must be objects")
+        student_id = str(entry.get("student_id", ""))
+        session_id = str(entry.get("session_id", ""))
+        record_path = entry.get("record_path")
+        record_sha = entry.get("record_sha256")
+        truth = entry.get("truth")
+        if not student_id or not session_id:
+            raise ValueError("benchmark manifest entries require student_id and session_id")
+        canonical_path = f"{student_id}/{session_id}/record.json"
+        if not isinstance(record_path, str) or record_path != canonical_path:
+            raise ValueError("benchmark manifest record paths must match student/session")
+        if not isinstance(record_sha, str) or len(record_sha) != 64:
+            raise ValueError("benchmark manifest record SHA256 is invalid")
+        if truth not in {"match", "mismatch"}:
+            raise ValueError("benchmark manifest truth must be match or mismatch")
+        identity = (student_id, session_id)
+        if record_path in expected_paths or identity in expected_identities:
+            raise ValueError("benchmark manifest contains duplicate session entries")
+        expected_paths.add(record_path)
+        expected_identities.add(identity)
+        normalized_entries.append(
+            {
+                "student_id": student_id,
+                "session_id": session_id,
+                "record_path": record_path,
+                "record_sha256": record_sha,
+                "truth": str(truth),
+            }
+        )
+
+    mismatch_identities = {
+        (entry["student_id"], entry["session_id"])
+        for entry in normalized_entries
+        if entry["truth"] == "mismatch"
+    }
+    if mismatch_identities != {known_identity}:
+        raise ValueError(
+            "benchmark manifest must identify exactly one known impersonation"
+        )
+
+    actual_paths = {
+        path.relative_to(benchmark_archive).as_posix()
+        for path in benchmark_archive.glob("*/*/record.json")
+    }
+    if actual_paths != expected_paths:
+        raise ValueError("benchmark archive record paths do not match the manifest")
+
     rows: list[dict[str, Any]] = []
-    for record_path in record_paths:
-        record = _load_json_object(record_path, "benchmark record")
+    for entry in sorted(normalized_entries, key=lambda item: item["record_path"]):
+        record_path = benchmark_archive / entry["record_path"]
+        try:
+            record_bytes = record_path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"benchmark record is unreadable: {record_path}: {exc}") from exc
+        if hashlib.sha256(record_bytes).hexdigest() != entry["record_sha256"]:
+            raise ValueError(
+                f"benchmark record SHA256 does not match the manifest: {entry['record_path']}"
+            )
+        try:
+            record = json.loads(record_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError(f"benchmark record is unreadable: {record_path}: {exc}") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"benchmark record root must be an object: {record_path}")
         request = record.get("request")
         if not isinstance(request, dict):
             raise ValueError(f"benchmark record has no request object: {record_path}")
@@ -380,6 +507,13 @@ def _load_benchmark_rows(benchmark_archive: Path) -> list[dict[str, Any]]:
             or request.get("training_session_id")
             or record_path.parent.name
         )
+        if (student_id, session_id) != (
+            entry["student_id"],
+            entry["session_id"],
+        ):
+            raise ValueError(
+                f"benchmark record identity does not match the manifest: {entry['record_path']}"
+            )
         photos = request.get("photos")
         if not student_id or not isinstance(photos, list):
             raise ValueError(f"benchmark record is malformed: {record_path}")
@@ -387,21 +521,18 @@ def _load_benchmark_rows(benchmark_archive: Path) -> list[dict[str, Any]]:
             {
                 "student_id": student_id,
                 "session_id": session_id,
-                "label": (
-                    "mismatch"
-                    if student_id == KNOWN_IMPOSTOR_STUDENT_ID
-                    else "match"
-                ),
+                "label": entry["truth"],
                 "ref_image_path": str(request.get("ref_image_path", "")),
                 "photos": photos,
             }
         )
-    known_count = sum(
-        row["student_id"] == KNOWN_IMPOSTOR_STUDENT_ID for row in rows
-    )
-    if known_count != 1:
-        raise ValueError("benchmark must contain the one known impersonation session")
-    return rows
+    provenance: dict[str, str | int] = {
+        "benchmark_manifest_schema_version": 1,
+        "benchmark_manifest_id": benchmark_id,
+        "benchmark_manifest_sha256": actual_manifest_sha,
+        "benchmark_manifest_file_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    return rows, provenance
 
 
 def _truth_reconstruction(rows: list[dict[str, Any]]) -> dict[str, int]:
@@ -434,6 +565,7 @@ def evaluate_release_candidate(
         raise ValueError("dataset manifest schema_version must be 1")
     artifact, onnx_path = _verify_artifact(dataset, adapter_dir)
     leaks = _student_split_leaks(dataset)
+    benchmark_rows, benchmark_provenance = _load_benchmark_rows(benchmark_archive)
     evaluation_rows = dataset.get("evaluation_sessions", [])
     assert isinstance(evaluation_rows, list)
 
@@ -446,7 +578,6 @@ def evaluate_release_candidate(
     adapted_confusion = _confusion(held_out, adapted=True)
     cross_student = _cross_student_metrics(held_out, scorer)
 
-    benchmark_rows = _load_benchmark_rows(benchmark_archive)
     benchmark = _evaluate_rows(benchmark_rows, pipeline, scorer)
     known = next(
         item for item in benchmark if item.student_id == KNOWN_IMPOSTOR_STUDENT_ID
@@ -475,6 +606,7 @@ def evaluate_release_candidate(
         "conditional_accuracy": _conditional_accuracy(adapted_confusion),
         **cross_student,
         "benchmark_sessions": len(benchmark),
+        **benchmark_provenance,
         "benchmark_raw_confusion": _confusion(benchmark, adapted=False),
         "benchmark_adapted_confusion": _confusion(benchmark, adapted=True),
         "known_impostor_detected": (

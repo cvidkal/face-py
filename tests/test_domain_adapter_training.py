@@ -261,8 +261,106 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
             self.assertTrue(report["known_impostor_detected"])
             self.assertEqual(report["new_false_accusations"], 0)
             self.assertEqual(report["benchmark_sessions"], 40)
+            benchmark_manifest = json.loads(
+                (benchmark / "benchmark-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                report["benchmark_manifest_id"], "synthetic-40-session-v1"
+            )
+            self.assertEqual(
+                report["benchmark_manifest_sha256"],
+                benchmark_manifest["manifest_sha256"],
+            )
+            self.assertEqual(
+                report["benchmark_manifest_file_sha256"],
+                hashlib.sha256(
+                    (benchmark / "benchmark-manifest.json").read_bytes()
+                ).hexdigest(),
+            )
             self.assertEqual(report["student_split_leaks"], 0)
             self.assertTrue(report["release_gate_passed"])
+
+    def test_rejects_a_different_session_set_even_when_count_remains_forty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            source = benchmark / "benchmark-01" / "session-01"
+            replacement_student = benchmark / "replacement-student"
+            replacement_student.mkdir()
+            source.rename(replacement_student / "replacement-session")
+            source.parent.rmdir()
+            pipeline = _EvaluationPipeline(vectors, raw_results)
+
+            with self.assertRaisesRegex(ValueError, "record paths"):
+                evaluate_release_candidate(
+                    dataset_path,
+                    adapter_dir,
+                    benchmark,
+                    pipeline_factory=lambda: pipeline,
+                    inference_session_factory=lambda _path: _DotAdapterSession(),
+                )
+
+            self.assertEqual(pipeline.session_checks, 0)
+
+    def test_rejects_record_content_tampering_without_count_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            record = benchmark / "benchmark-01" / "session-01" / "record.json"
+            record.write_text(record.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "record SHA256"):
+                evaluate_release_candidate(
+                    dataset_path,
+                    adapter_dir,
+                    benchmark,
+                    pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
+                    inference_session_factory=lambda _path: _DotAdapterSession(),
+                )
+
+    def test_rejects_benchmark_manifest_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            manifest_path = benchmark / "benchmark-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["manifest_sha256"] = "0" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "manifest SHA256"):
+                evaluate_release_candidate(
+                    dataset_path,
+                    adapter_dir,
+                    benchmark,
+                    pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
+                    inference_session_factory=lambda _path: _DotAdapterSession(),
+                )
+
+    def test_rejects_a_manifest_entry_mismatch_even_with_a_valid_manifest_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            manifest_path = benchmark / "benchmark-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["sessions"][1]["record_sha256"] = "0" * 64
+            self._write_benchmark_manifest(manifest_path, manifest)
+
+            with self.assertRaisesRegex(ValueError, "record SHA256"):
+                evaluate_release_candidate(
+                    dataset_path,
+                    adapter_dir,
+                    benchmark,
+                    pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
+                    inference_session_factory=lambda _path: _DotAdapterSession(),
+                )
 
     def test_reports_each_student_present_in_test_and_training_as_one_leak(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -548,6 +646,35 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
             (session_dir / "record.json").write_text(
                 json.dumps(record), encoding="utf-8"
             )
+        benchmark_manifest_path = benchmark / "benchmark-manifest.json"
+        entries = []
+        for record_path in sorted(benchmark.glob("*/*/record.json")):
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            entries.append(
+                {
+                    "student_id": record["student_id"],
+                    "session_id": record["session_id"],
+                    "record_path": record_path.relative_to(benchmark).as_posix(),
+                    "record_sha256": hashlib.sha256(record_path.read_bytes()).hexdigest(),
+                    "truth": (
+                        "mismatch"
+                        if record["student_id"] == KNOWN_IMPOSTOR_STUDENT_ID
+                        else "match"
+                    ),
+                }
+            )
+        self._write_benchmark_manifest(
+            benchmark_manifest_path,
+            {
+                "schema_version": 1,
+                "benchmark_id": "synthetic-40-session-v1",
+                "known_impostor": {
+                    "student_id": KNOWN_IMPOSTOR_STUDENT_ID,
+                    "session_id": "session-00",
+                },
+                "sessions": entries,
+            },
+        )
         return dataset_path, adapter_dir, benchmark, vectors, raw_results
 
     @staticmethod
@@ -586,6 +713,22 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
         (adapter_dir / "identity_domain_adapter.manifest.json").write_text(
             json.dumps(artifact), encoding="utf-8"
         )
+
+    @staticmethod
+    def _write_benchmark_manifest(path: Path, manifest: dict) -> None:
+        payload = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+        manifest = {
+            **payload,
+            "manifest_sha256": hashlib.sha256(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
 
 
 class EmbeddingExtractionTests(unittest.TestCase):
