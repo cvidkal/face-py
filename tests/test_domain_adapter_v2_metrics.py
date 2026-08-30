@@ -219,6 +219,35 @@ class DomainAdapterV2MetricTests(unittest.TestCase):
             )
             self.assertAlmostEqual(total, 1.0 / 3.0, places=7)
 
+    def test_pair_builder_rejects_human_mismatch_token_reused_by_different_ref_students(
+        self,
+    ) -> None:
+        sessions = [
+            self._session("student-a", "session-1", vector=(1.0, 0.0)),
+            self._session("student-b", "session-1", vector=(0.0, 1.0)),
+            self._session("student-z", "session-9", label="mismatch", vector=(1.0, 0.0)),
+            self._session("student-y", "session-8", label="mismatch", vector=(0.8, 0.2)),
+        ]
+        evidence = (
+            HumanMismatchEvidence(
+                student_id="student-z",
+                session_id="session-9",
+                ordered_pair_token="shared-human-token",
+                photo_student_token="hidden-student-token",
+                photo_session_token="hidden-session-1",
+            ),
+            HumanMismatchEvidence(
+                student_id="student-y",
+                session_id="session-8",
+                ordered_pair_token="shared-human-token",
+                photo_student_token="hidden-student-token",
+                photo_session_token="hidden-session-2",
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "contradictory group metadata"):
+            build_v2_pair_set(sessions, human_mismatch_evidence=evidence)
+
     def test_pair_builder_rejects_mismatch_session_without_grouping_evidence(self) -> None:
         sessions = [
             self._session("student-a", "session-1", vector=(1.0, 0.0)),

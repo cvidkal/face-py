@@ -547,6 +547,7 @@ def _validate_group_metadata(
         else:
             signature = (
                 category,
+                pair.ref_student_id,
                 pair.photo_student_id,
             )
         previous = expected.setdefault(group_id, signature)
