@@ -18,12 +18,17 @@ The benchmark archive is fail-closed around ``benchmark-manifest.json`` schema 1
 There must be exactly 40 entries and archive records, with no unlisted paths. The one
 ``mismatch`` entry must be the named known impersonation. Record bytes and record identities
 must match their entries before any face replay begins.
+
+The manifest's digest is not a trust anchor by itself. Callers must pin it independently
+through ``evaluate_release_candidate(..., benchmark_manifest_sha256)`` or the CLI's
+``--benchmark-manifest-sha256`` option.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -52,6 +57,16 @@ BENCHMARK_MANIFEST = "benchmark-manifest.json"
 KNOWN_IMPOSTOR_STUDENT_ID = "S177509932310186"
 EXPECTED_BENCHMARK_SESSIONS = 40
 _PREDICTIONS = ("match", "mismatch", "inconclusive")
+
+
+class BenchmarkManifestTrustError(ValueError):
+    def __init__(self, expected: str, observed: str):
+        self.expected = expected
+        self.observed = observed
+        super().__init__(
+            "benchmark manifest does not match trusted expected SHA256 "
+            f"(expected {expected}, observed {observed})"
+        )
 
 
 def release_gate_passes(report: dict) -> bool:
@@ -383,7 +398,20 @@ def _cross_student_metrics(
 
 def _load_benchmark_rows(
     benchmark_archive: Path,
+    expected_manifest_sha256: str,
 ) -> tuple[list[dict[str, Any]], dict[str, str | int]]:
+    if (
+        not isinstance(expected_manifest_sha256, str)
+        or len(expected_manifest_sha256) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in expected_manifest_sha256
+        )
+    ):
+        raise ValueError(
+            "trusted expected benchmark manifest SHA256 must be 64 hex characters"
+        )
+    expected_manifest_sha256 = expected_manifest_sha256.lower()
     manifest_path = benchmark_archive / BENCHMARK_MANIFEST
     try:
         manifest_bytes = manifest_path.read_bytes()
@@ -404,6 +432,11 @@ def _load_benchmark_rows(
         key: value for key, value in manifest.items() if key != "manifest_sha256"
     }
     actual_manifest_sha = _canonical_sha256(manifest_payload)
+    if not hmac.compare_digest(expected_manifest_sha256, actual_manifest_sha):
+        raise BenchmarkManifestTrustError(
+            expected_manifest_sha256,
+            actual_manifest_sha,
+        )
     if (
         not isinstance(declared_manifest_sha, str)
         or declared_manifest_sha != actual_manifest_sha
@@ -530,7 +563,11 @@ def _load_benchmark_rows(
         "benchmark_manifest_schema_version": 1,
         "benchmark_manifest_id": benchmark_id,
         "benchmark_manifest_sha256": actual_manifest_sha,
+        "benchmark_manifest_expected_sha256": expected_manifest_sha256,
+        "benchmark_manifest_observed_sha256": actual_manifest_sha,
         "benchmark_manifest_file_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "known_impostor_student_id": known_identity[0],
+        "known_impostor_session_id": known_identity[1],
     }
     return rows, provenance
 
@@ -552,6 +589,7 @@ def evaluate_release_candidate(
     dataset_manifest: Path,
     adapter_dir: Path,
     benchmark_archive: Path,
+    benchmark_manifest_sha256: str,
     *,
     pipeline_factory: Callable[[], Any] = build_pipeline_from_env,
     inference_session_factory: Callable[[Path], Any] | None = None,
@@ -565,7 +603,10 @@ def evaluate_release_candidate(
         raise ValueError("dataset manifest schema_version must be 1")
     artifact, onnx_path = _verify_artifact(dataset, adapter_dir)
     leaks = _student_split_leaks(dataset)
-    benchmark_rows, benchmark_provenance = _load_benchmark_rows(benchmark_archive)
+    benchmark_rows, benchmark_provenance = _load_benchmark_rows(
+        benchmark_archive,
+        benchmark_manifest_sha256,
+    )
     evaluation_rows = dataset.get("evaluation_sessions", [])
     assert isinstance(evaluation_rows, list)
 
@@ -580,7 +621,13 @@ def evaluate_release_candidate(
 
     benchmark = _evaluate_rows(benchmark_rows, pipeline, scorer)
     known = next(
-        item for item in benchmark if item.student_id == KNOWN_IMPOSTOR_STUDENT_ID
+        item
+        for item in benchmark
+        if (item.student_id, item.session_id)
+        == (
+            benchmark_provenance["known_impostor_student_id"],
+            benchmark_provenance["known_impostor_session_id"],
+        )
     )
     new_false_accusations = sum(
         item.truth == "match"
@@ -653,6 +700,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-manifest", type=Path, required=True)
     parser.add_argument("--adapter-dir", type=Path, required=True)
     parser.add_argument("--benchmark-archive", type=Path, required=True)
+    parser.add_argument("--benchmark-manifest-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -664,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
             args.dataset_manifest,
             args.adapter_dir,
             args.benchmark_archive,
+            args.benchmark_manifest_sha256,
         )
         report["release_gate_passed"] = release_gate_passes(report)
     except Exception as exc:
@@ -677,6 +726,9 @@ def main(argv: list[str] | None = None) -> int:
             "student_split_leaks": 1,
             "release_gate_passed": False,
         }
+        if isinstance(exc, BenchmarkManifestTrustError):
+            report["benchmark_manifest_expected_sha256"] = exc.expected
+            report["benchmark_manifest_observed_sha256"] = exc.observed
     _atomic_write_private_json(args.output, report)
     return 0 if release_gate_passes(report) else 2
 

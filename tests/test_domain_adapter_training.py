@@ -237,11 +237,13 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
             )
             pipeline = _EvaluationPipeline(vectors, raw_results)
             inference = _DotAdapterSession()
+            trusted_benchmark_sha = self._trusted_benchmark_sha(benchmark)
 
             report = evaluate_release_candidate(
                 dataset_path,
                 adapter_dir,
                 benchmark,
+                trusted_benchmark_sha,
                 pipeline_factory=lambda: pipeline,
                 inference_session_factory=lambda _path: inference,
             )
@@ -268,7 +270,11 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                 report["benchmark_manifest_id"], "synthetic-40-session-v1"
             )
             self.assertEqual(
-                report["benchmark_manifest_sha256"],
+                report["benchmark_manifest_expected_sha256"],
+                trusted_benchmark_sha,
+            )
+            self.assertEqual(
+                report["benchmark_manifest_observed_sha256"],
                 benchmark_manifest["manifest_sha256"],
             )
             self.assertEqual(
@@ -298,6 +304,7 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                     dataset_path,
                     adapter_dir,
                     benchmark,
+                    self._trusted_benchmark_sha(benchmark),
                     pipeline_factory=lambda: pipeline,
                     inference_session_factory=lambda _path: _DotAdapterSession(),
                 )
@@ -318,6 +325,7 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                     dataset_path,
                     adapter_dir,
                     benchmark,
+                    self._trusted_benchmark_sha(benchmark),
                     pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
                     inference_session_factory=lambda _path: _DotAdapterSession(),
                 )
@@ -329,6 +337,7 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                 self._release_fixture(root)
             )
             manifest_path = benchmark / "benchmark-manifest.json"
+            trusted_benchmark_sha = self._trusted_benchmark_sha(benchmark)
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["manifest_sha256"] = "0" * 64
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -338,6 +347,7 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                     dataset_path,
                     adapter_dir,
                     benchmark,
+                    trusted_benchmark_sha,
                     pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
                     inference_session_factory=lambda _path: _DotAdapterSession(),
                 )
@@ -358,9 +368,42 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                     dataset_path,
                     adapter_dir,
                     benchmark,
+                    self._trusted_benchmark_sha(benchmark),
                     pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
                     inference_session_factory=lambda _path: _DotAdapterSession(),
                 )
+
+    def test_rejects_a_fully_regenerated_replacement_archive_against_pinned_digest(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            intended_root = root / "intended"
+            replacement_root = root / "replacement"
+            intended_root.mkdir()
+            replacement_root.mkdir()
+            _, _, intended_benchmark, _, _ = self._release_fixture(intended_root)
+            dataset_path, adapter_dir, replacement_benchmark, vectors, raw_results = (
+                self._release_fixture(replacement_root)
+            )
+            trusted_benchmark_sha = self._trusted_benchmark_sha(intended_benchmark)
+            self.assertNotEqual(
+                trusted_benchmark_sha,
+                self._trusted_benchmark_sha(replacement_benchmark),
+            )
+            pipeline = _EvaluationPipeline(vectors, raw_results)
+
+            with self.assertRaisesRegex(ValueError, "trusted expected SHA256"):
+                evaluate_release_candidate(
+                    dataset_path,
+                    adapter_dir,
+                    replacement_benchmark,
+                    trusted_benchmark_sha,
+                    pipeline_factory=lambda: pipeline,
+                    inference_session_factory=lambda _path: _DotAdapterSession(),
+                )
+
+            self.assertEqual(pipeline.session_checks, 0)
 
     def test_reports_each_student_present_in_test_and_training_as_one_leak(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -382,6 +425,7 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                 dataset_path,
                 adapter_dir,
                 benchmark,
+                self._trusted_benchmark_sha(benchmark),
                 pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
                 inference_session_factory=lambda _path: _DotAdapterSession(),
             )
@@ -410,6 +454,7 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                 dataset_path,
                 adapter_dir,
                 benchmark,
+                self._trusted_benchmark_sha(benchmark),
                 pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
                 inference_session_factory=lambda _path: _DotAdapterSession(),
             )
@@ -431,6 +476,7 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                     dataset_path,
                     adapter_dir,
                     benchmark,
+                    self._trusted_benchmark_sha(benchmark),
                     pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
                     inference_session_factory=lambda _path: _DotAdapterSession(),
                 )
@@ -454,12 +500,89 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                 dataset_path,
                 adapter_dir,
                 benchmark,
+                self._trusted_benchmark_sha(benchmark),
                 pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
                 inference_session_factory=lambda _path: _DotAdapterSession(),
             )
 
             self.assertEqual(report["known_impostor_raw_status"], "match")
             self.assertEqual(report["known_impostor_adapted_status"], "mismatch")
+            self.assertFalse(report["known_impostor_detected"])
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_known_impostor_uses_exact_manifest_session_when_same_student_sorts_first(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            manifest_path = benchmark / "benchmark-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            earlier_entry = next(
+                entry
+                for entry in manifest["sessions"]
+                if entry["student_id"] == "benchmark-01"
+            )
+            source = benchmark / earlier_entry["record_path"]
+            earlier_session_id = "aaa-earlier-clean-session"
+            target = (
+                benchmark
+                / KNOWN_IMPOSTOR_STUDENT_ID
+                / earlier_session_id
+                / "record.json"
+            )
+            source.parent.rename(target.parent)
+            source.parent.parent.rmdir()
+            earlier_record = json.loads(target.read_text(encoding="utf-8"))
+            earlier_ref_path = earlier_record["request"]["ref_image_path"]
+            earlier_photo_path = earlier_record["request"]["photos"][0]["image_path"]
+            moved_ref_path = str(target.parent / "ref.png")
+            moved_photo_path = str(target.parent / "photo.png")
+            earlier_record["student_id"] = KNOWN_IMPOSTOR_STUDENT_ID
+            earlier_record["session_id"] = earlier_session_id
+            earlier_record["request"]["ref_image_path"] = moved_ref_path
+            earlier_record["request"]["photos"][0]["image_path"] = moved_photo_path
+            target.write_text(json.dumps(earlier_record), encoding="utf-8")
+            vectors[moved_ref_path] = vectors.pop(earlier_ref_path)
+            vectors[moved_photo_path] = vectors.pop(earlier_photo_path)
+            earlier_entry.update(
+                {
+                    "student_id": KNOWN_IMPOSTOR_STUDENT_ID,
+                    "session_id": earlier_session_id,
+                    "record_path": target.relative_to(benchmark).as_posix(),
+                    "record_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    "truth": "match",
+                }
+            )
+            self._write_benchmark_manifest(manifest_path, manifest)
+
+            named_record = (
+                benchmark
+                / KNOWN_IMPOSTOR_STUDENT_ID
+                / "session-00"
+                / "record.json"
+            )
+            named_ref_path = json.loads(named_record.read_text(encoding="utf-8"))[
+                "request"
+            ]["ref_image_path"]
+            raw_results[moved_ref_path] = ("mismatch", "inconsistent")
+            raw_results[named_ref_path] = ("match", "inconsistent")
+
+            report = evaluate_release_candidate(
+                dataset_path,
+                adapter_dir,
+                benchmark,
+                self._trusted_benchmark_sha(benchmark),
+                pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
+                inference_session_factory=lambda _path: _DotAdapterSession(),
+            )
+
+            self.assertEqual(report["known_impostor_student_id"], KNOWN_IMPOSTOR_STUDENT_ID)
+            self.assertEqual(report["known_impostor_session_id"], "session-00")
+            self.assertEqual(report["known_impostor_raw_status"], "match")
+            self.assertEqual(report["known_impostor_adapted_status"], "match")
             self.assertFalse(report["known_impostor_detected"])
             self.assertFalse(report["release_gate_passed"])
 
@@ -477,6 +600,7 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                         dataset_path,
                         adapter_dir,
                         benchmark,
+                        self._trusted_benchmark_sha(benchmark),
                         pipeline_factory=lambda: pipeline,
                         inference_session_factory=lambda _path: _DotAdapterSession(),
                     )
@@ -506,6 +630,8 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                         "candidate",
                         "--benchmark-archive",
                         "benchmark",
+                        "--benchmark-manifest-sha256",
+                        "0" * 64,
                         "--output",
                         str(output),
                     ]
@@ -531,6 +657,8 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
                         "candidate",
                         "--benchmark-archive",
                         "benchmark",
+                        "--benchmark-manifest-sha256",
+                        "0" * 64,
                         "--output",
                         str(output),
                     ]
@@ -540,6 +668,62 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
             self.assertEqual(exit_code, 2)
             self.assertEqual(report["evaluation_error"], "bad candidate")
             self.assertFalse(report["release_gate_passed"])
+
+    def test_cli_requires_trusted_benchmark_manifest_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            with redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    evaluation_main(
+                        [
+                            "--dataset-manifest",
+                            "dataset.json",
+                            "--adapter-dir",
+                            "candidate",
+                            "--benchmark-archive",
+                            "benchmark",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("--benchmark-manifest-sha256", stderr.getvalue())
+            self.assertFalse(output.exists())
+
+    def test_cli_wrong_trusted_benchmark_digest_writes_private_failure_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, _vectors, _raw_results = (
+                self._release_fixture(root)
+            )
+            output = root / "wrong-digest-report.json"
+
+            exit_code = evaluation_main(
+                [
+                    "--dataset-manifest",
+                    str(dataset_path),
+                    "--adapter-dir",
+                    str(adapter_dir),
+                    "--benchmark-archive",
+                    str(benchmark),
+                    "--benchmark-manifest-sha256",
+                    "0" * 64,
+                    "--output",
+                    str(output),
+                ]
+            )
+
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 2)
+            self.assertIn("trusted expected SHA256", report["evaluation_error"])
+            self.assertEqual(report["benchmark_manifest_expected_sha256"], "0" * 64)
+            self.assertEqual(
+                report["benchmark_manifest_observed_sha256"],
+                self._trusted_benchmark_sha(benchmark),
+            )
+            self.assertFalse(report["release_gate_passed"])
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
 
     def _release_fixture(
         self, root: Path
@@ -729,6 +913,13 @@ class HeldOutReleaseEvaluationTests(unittest.TestCase):
             ).hexdigest(),
         }
         path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    @staticmethod
+    def _trusted_benchmark_sha(benchmark: Path) -> str:
+        manifest = json.loads(
+            (benchmark / "benchmark-manifest.json").read_text(encoding="utf-8")
+        )
+        return str(manifest["manifest_sha256"])
 
 
 class EmbeddingExtractionTests(unittest.TestCase):
