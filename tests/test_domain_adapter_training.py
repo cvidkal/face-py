@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -26,6 +27,12 @@ from tools.domain_adapter_training import (
     select_threshold,
     train_adapter,
     write_candidate_artifacts,
+)
+from tools.evaluate_domain_adapter import (
+    KNOWN_IMPOSTOR_STUDENT_ID,
+    evaluate_release_candidate,
+    main as evaluation_main,
+    release_gate_passes,
 )
 from tools.train_domain_adapter import main as training_main
 
@@ -185,6 +192,400 @@ class ThresholdSelectionTests(unittest.TestCase):
         self.assertAlmostEqual(metrics.threshold, 0.250, places=6)
         self.assertEqual(metrics.true_accept_rate, 1.0)
         self.assertEqual(metrics.false_accept_rate, 0.0)
+
+
+class ReleaseGateTests(unittest.TestCase):
+    @staticmethod
+    def _passing_report() -> dict:
+        return {
+            "cross_student_far": 0.01,
+            "conditional_accuracy": 0.70,
+            "known_impostor_detected": True,
+            "new_false_accusations": 0,
+            "student_split_leaks": 0,
+        }
+
+    def test_release_gate_accepts_exact_far_and_accuracy_boundaries(self) -> None:
+        self.assertTrue(release_gate_passes(self._passing_report()))
+
+    def test_release_gate_rejects_false_accept_rate_above_one_percent(self) -> None:
+        report = {**self._passing_report(), "cross_student_far": 0.0101}
+        self.assertFalse(release_gate_passes(report))
+
+    def test_release_gate_requires_seventy_percent_conditional_accuracy(self) -> None:
+        report = {**self._passing_report(), "conditional_accuracy": 0.699}
+        self.assertFalse(release_gate_passes(report))
+
+    def test_release_gate_requires_impostor_and_zero_accusations_and_leaks(self) -> None:
+        for change in (
+            {"known_impostor_detected": False},
+            {"new_false_accusations": 1},
+            {"student_split_leaks": 1},
+        ):
+            with self.subTest(change=change):
+                self.assertFalse(release_gate_passes({**self._passing_report(), **change}))
+
+
+class HeldOutReleaseEvaluationTests(unittest.TestCase):
+    def test_evaluates_every_test_session_and_cross_student_pair_without_adapting_stage_one_failures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            pipeline = _EvaluationPipeline(vectors, raw_results)
+            inference = _DotAdapterSession()
+
+            report = evaluate_release_candidate(
+                dataset_path,
+                adapter_dir,
+                benchmark,
+                pipeline_factory=lambda: pipeline,
+                inference_session_factory=lambda _path: inference,
+            )
+
+            self.assertEqual(pipeline.session_checks, 45)
+            self.assertEqual(inference.scored_pairs, 48)
+            self.assertEqual(report["held_out_test_sessions"], 5)
+            self.assertEqual(report["adapter_eligible_test_sessions"], 3)
+            self.assertEqual(report["cross_student_pairs"], 6)
+            self.assertEqual(report["cross_student_false_accepts"], 0)
+            self.assertEqual(report["cross_student_far"], 0.0)
+            self.assertEqual(report["conditional_accuracy"], 0.75)
+            self.assertEqual(report["raw_confusion"]["match"]["inconclusive"], 2)
+            self.assertEqual(report["adapted_confusion"]["match"]["match"], 2)
+            self.assertEqual(report["adapted_confusion"]["match"]["mismatch"], 1)
+            self.assertEqual(report["truth_reconstruction"]["implicit_sessions"], 1)
+            self.assertTrue(report["known_impostor_detected"])
+            self.assertEqual(report["new_false_accusations"], 0)
+            self.assertEqual(report["benchmark_sessions"], 40)
+            self.assertEqual(report["student_split_leaks"], 0)
+            self.assertTrue(report["release_gate_passed"])
+
+    def test_reports_each_student_present_in_test_and_training_as_one_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+            dataset["sessions"].append(
+                {
+                    **dataset["evaluation_sessions"][0],
+                    "session_id": "leaked-train-session",
+                    "split": "train",
+                }
+            )
+            self._write_dataset_and_bind_artifact(dataset_path, adapter_dir, dataset)
+
+            report = evaluate_release_candidate(
+                dataset_path,
+                adapter_dir,
+                benchmark,
+                pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
+                inference_session_factory=lambda _path: _DotAdapterSession(),
+            )
+
+            self.assertEqual(report["student_split_leaks"], 1)
+            self.assertEqual(report["student_split_leak_ids"], ["test-a"])
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_reports_students_shared_by_train_and_validation_as_leaks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+            dataset["sessions"].append(
+                {
+                    **dataset["sessions"][0],
+                    "session_id": "validation-session",
+                    "split": "validation",
+                }
+            )
+            self._write_dataset_and_bind_artifact(dataset_path, adapter_dir, dataset)
+
+            report = evaluate_release_candidate(
+                dataset_path,
+                adapter_dir,
+                benchmark,
+                pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
+                inference_session_factory=lambda _path: _DotAdapterSession(),
+            )
+
+            self.assertEqual(report["student_split_leaks"], 1)
+            self.assertEqual(report["student_split_leak_ids"], ["train-only"])
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_refuses_an_onnx_file_that_does_not_match_the_artifact_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            (adapter_dir / "identity_domain_adapter.onnx").write_bytes(b"corrupt")
+
+            with self.assertRaisesRegex(ValueError, "SHA256"):
+                evaluate_release_candidate(
+                    dataset_path,
+                    adapter_dir,
+                    benchmark,
+                    pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
+                    inference_session_factory=lambda _path: _DotAdapterSession(),
+                )
+
+    def test_known_impostor_must_remain_mismatch_in_raw_and_adapted_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            known_record = next(
+                (benchmark / KNOWN_IMPOSTOR_STUDENT_ID).glob("*/record.json")
+            )
+            request = json.loads(known_record.read_text(encoding="utf-8"))["request"]
+            ref_path = request["ref_image_path"]
+            photo_path = request["photos"][0]["image_path"]
+            raw_results[ref_path] = ("match", "consistent")
+            vectors[photo_path] = -vectors[ref_path]
+
+            report = evaluate_release_candidate(
+                dataset_path,
+                adapter_dir,
+                benchmark,
+                pipeline_factory=lambda: _EvaluationPipeline(vectors, raw_results),
+                inference_session_factory=lambda _path: _DotAdapterSession(),
+            )
+
+            self.assertEqual(report["known_impostor_raw_status"], "match")
+            self.assertEqual(report["known_impostor_adapted_status"], "mismatch")
+            self.assertFalse(report["known_impostor_detected"])
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_runs_raw_stage_one_for_all_held_out_sessions_before_adapter_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_path, adapter_dir, benchmark, vectors, raw_results = (
+                self._release_fixture(root)
+            )
+            pipeline = _EvaluationPipeline(vectors, raw_results)
+
+            with patch("tools.evaluate_domain_adapter.cv2.imread", return_value=None):
+                with self.assertRaisesRegex(ValueError, "reference is unreadable"):
+                    evaluate_release_candidate(
+                        dataset_path,
+                        adapter_dir,
+                        benchmark,
+                        pipeline_factory=lambda: pipeline,
+                        inference_session_factory=lambda _path: _DotAdapterSession(),
+                    )
+
+            self.assertEqual(pipeline.session_checks, 5)
+
+    def test_cli_writes_private_report_before_returning_gate_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            failing = {
+                "cross_student_far": 0.02,
+                "conditional_accuracy": 0.8,
+                "known_impostor_detected": True,
+                "new_false_accusations": 0,
+                "student_split_leaks": 0,
+                "release_gate_passed": False,
+            }
+            with patch(
+                "tools.evaluate_domain_adapter.evaluate_release_candidate",
+                return_value=failing,
+            ):
+                exit_code = evaluation_main(
+                    [
+                        "--dataset-manifest",
+                        "dataset.json",
+                        "--adapter-dir",
+                        "candidate",
+                        "--benchmark-archive",
+                        "benchmark",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), failing)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(list(output.parent.glob(f".{output.name}.*.tmp")), [])
+
+    def test_cli_serializes_evaluation_errors_and_returns_two(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            with patch(
+                "tools.evaluate_domain_adapter.evaluate_release_candidate",
+                side_effect=ValueError("bad candidate"),
+            ):
+                exit_code = evaluation_main(
+                    [
+                        "--dataset-manifest",
+                        "dataset.json",
+                        "--adapter-dir",
+                        "candidate",
+                        "--benchmark-archive",
+                        "benchmark",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(report["evaluation_error"], "bad candidate")
+            self.assertFalse(report["release_gate_passed"])
+
+    def _release_fixture(
+        self, root: Path
+    ) -> tuple[Path, Path, Path, dict[str, np.ndarray], dict[str, tuple[str, str]]]:
+        vectors: dict[str, np.ndarray] = {}
+        raw_results = {
+            "test-a": ("inconclusive", "consistent"),
+            "test-b": ("match", "single"),
+            "test-c": ("mismatch", "consistent"),
+            "test-d": ("mismatch", "inconsistent"),
+            "test-e": ("inconclusive", "unknown"),
+        }
+        evaluation_rows = []
+        basis = np.eye(128, dtype=np.float32)
+        for index, student in enumerate(raw_results):
+            ref = root / f"{student}-ref.png"
+            photo = root / f"{student}-photo.png"
+            self._write_vector_image(ref, index + 1)
+            self._write_vector_image(photo, index + 31)
+            ref_vector = basis[index]
+            if student == "test-a":
+                photo_vector = np.zeros(128, dtype=np.float32)
+                photo_vector[index] = 0.8
+                photo_vector[20] = 0.6
+            elif student == "test-c":
+                photo_vector = -basis[index]
+            else:
+                photo_vector = basis[index]
+            vectors[str(ref)] = ref_vector
+            vectors[str(photo)] = photo_vector
+            reasons = ["test_split"]
+            if student == "test-b":
+                reasons.append("implicit_correct")
+            evaluation_rows.append(
+                {
+                    "student_id": student,
+                    "session_id": f"session-{student}",
+                    "split": "test",
+                    "label": "mismatch" if student == "test-c" else "match",
+                    "ref_image_path": str(ref),
+                    "photos": [
+                        {
+                            "sequence_no": 1,
+                            "photo_type": "sign_in",
+                            "image_path": str(photo),
+                        }
+                    ],
+                    "source_feedback_ids": [f"feedback-{student}"],
+                    "training_exclusion_reasons": reasons,
+                }
+            )
+        dataset = {
+            "schema_version": 1,
+            "snapshot": "2026-08-30T12:00:00+00:00",
+            "split_seed": "seed-v1",
+            "sessions": [
+                {
+                    **evaluation_rows[0],
+                    "student_id": "train-only",
+                    "session_id": "train-session",
+                    "split": "train",
+                    "training_exclusion_reasons": [],
+                }
+            ],
+            "evaluation_sessions": evaluation_rows,
+        }
+        dataset_path = root / "dataset.json"
+        adapter_dir = root / "candidate"
+        adapter_dir.mkdir()
+        self._write_dataset_and_bind_artifact(dataset_path, adapter_dir, dataset)
+
+        benchmark = root / "benchmark"
+        for index in range(40):
+            student = (
+                KNOWN_IMPOSTOR_STUDENT_ID if index == 0 else f"benchmark-{index:02d}"
+            )
+            session_dir = benchmark / student / f"session-{index:02d}"
+            session_dir.mkdir(parents=True)
+            ref = session_dir / "ref.png"
+            photo = session_dir / "photo.png"
+            self._write_vector_image(ref, index + 61)
+            self._write_vector_image(photo, index + 101)
+            vectors[str(ref)] = basis[index + 40]
+            vectors[str(photo)] = basis[index + 40]
+            raw_results[str(ref)] = (
+                ("mismatch", "inconsistent")
+                if student == KNOWN_IMPOSTOR_STUDENT_ID
+                else ("match", "consistent")
+            )
+            record = {
+                "student_id": student,
+                "session_id": f"session-{index:02d}",
+                "request": {
+                    "ref_image_path": str(ref),
+                    "photos": [
+                        {
+                            "sequence_no": 1,
+                            "photo_type": "sign_in",
+                            "image_path": str(photo),
+                        }
+                    ],
+                },
+            }
+            (session_dir / "record.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+        return dataset_path, adapter_dir, benchmark, vectors, raw_results
+
+    @staticmethod
+    def _write_vector_image(path: Path, value: int) -> None:
+        image = np.full((2, 2, 3), value, dtype=np.uint8)
+        if not cv2.imwrite(str(path), image):
+            raise AssertionError(f"failed to write {path}")
+
+    @staticmethod
+    def _write_dataset_and_bind_artifact(
+        dataset_path: Path, adapter_dir: Path, dataset: dict
+    ) -> None:
+        dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+        onnx_path = adapter_dir / "identity_domain_adapter.onnx"
+        onnx_path.write_bytes(b"synthetic onnx")
+        dataset_sha = hashlib.sha256(
+            json.dumps(
+                dataset,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        artifact = {
+            "schema_version": 1,
+            "model_version": "synthetic-v1",
+            "embedding_dimension": 128,
+            "match_threshold": 0.35,
+            "onnx_file": onnx_path.name,
+            "onnx_sha256": hashlib.sha256(onnx_path.read_bytes()).hexdigest(),
+            "onnx_parity_max_abs_error": 1e-6,
+            "source_dataset_sha256": dataset_sha,
+            "input_names": ["ref_embedding", "photo_embedding"],
+            "output_name": "adapted_cosine",
+        }
+        (adapter_dir / "identity_domain_adapter.manifest.json").write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
 
 
 class EmbeddingExtractionTests(unittest.TestCase):
@@ -497,6 +898,61 @@ class ArtifactAndCliTests(unittest.TestCase):
             labels=np.asarray([1.0, 1.0, 0.0, 0.0], dtype=np.float32),
             metadata=(),
         )
+
+
+class _EvaluationPipeline:
+    def __init__(
+        self,
+        vectors: dict[str, np.ndarray],
+        raw_results: dict[str, tuple[str, str]],
+    ):
+        self.vectors = vectors
+        self.raw_results = raw_results
+        self.session_checks = 0
+
+    def session_check(self, ref_image_path: str, _photos: list[dict]) -> SimpleNamespace:
+        self.session_checks += 1
+        key = (
+            ref_image_path
+            if ref_image_path in self.raw_results
+            else Path(ref_image_path).stem.removesuffix("-ref")
+        )
+        status, consistency = self.raw_results[key]
+        return SimpleNamespace(
+            session_status=status,
+            internal_consistency=consistency,
+        )
+
+    def _extract_or_raise(self, image: np.ndarray) -> np.ndarray:
+        marker = int(image[0, 0, 0])
+        for path, vector in self.vectors.items():
+            loaded = cv2.imread(path)
+            if loaded is not None and int(loaded[0, 0, 0]) == marker:
+                return vector
+        raise RuntimeError(f"unknown image marker: {marker}")
+
+    def _process_photo_for_session(self, photo: dict) -> SimpleNamespace:
+        return SimpleNamespace(
+            passes_gate=True,
+            _embedding=self.vectors[photo["image_path"]],
+        )
+
+
+class _DotAdapterSession:
+    def __init__(self) -> None:
+        self.scored_pairs = 0
+
+    def run(self, outputs: list[str], inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
+        if outputs != ["adapted_cosine"]:
+            raise AssertionError(outputs)
+        refs = inputs["ref_embedding"]
+        photos = inputs["photo_embedding"]
+        self.scored_pairs += len(refs)
+        scores = (refs * photos).sum(axis=1)
+        same_axis = np.argmax(np.abs(refs), axis=1) == np.argmax(
+            np.abs(photos), axis=1
+        )
+        return [(scores + same_axis.astype(np.float32) * 0.4).astype(np.float32)]
 
 
 class _FakePipeline:
