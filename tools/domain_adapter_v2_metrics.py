@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,6 +17,7 @@ _FOLD_COUNT = 5
 _FOLD_SEED = "identity-domain-adapter-v2-folds"
 _BOOTSTRAP_NAMESPACE = "identity-domain-adapter-v2-bootstrap"
 _GROUP_NAMESPACE = "identity-domain-adapter-v2-group"
+_BOOTSTRAP_DRAW_BATCH_SIZE = 128
 _SPLIT_ORDER = {"train": 0, "validation": 1, "test": 2}
 _NEGATIVE_CATEGORY = Literal["synthetic_cross_student", "human_mismatch"]
 _PAIR_CATEGORY_ORDER = {"synthetic_cross_student": 0, "human_mismatch": 1}
@@ -47,6 +48,15 @@ class V2PairSet:
         ):
             totals[category] += float(weight)
         return dict(totals)
+
+
+@dataclass(frozen=True)
+class HumanMismatchEvidence:
+    student_id: str
+    session_id: str
+    ordered_pair_token: str
+    photo_student_token: str
+    photo_session_token: str
 
 
 @dataclass(frozen=True)
@@ -101,7 +111,11 @@ def assign_training_folds(
     return {index: tuple(items) for index, items in folds.items()}
 
 
-def build_v2_pair_set(sessions: Sequence[SessionEmbedding]) -> V2PairSet:
+def _build_v2_pair_set(
+    sessions: Sequence[SessionEmbedding],
+    *,
+    human_mismatch_evidence: Sequence[HumanMismatchEvidence],
+) -> V2PairSet:
     ordered = tuple(sorted(sessions, key=_session_sort_key))
     dimension = _embedding_dimension(ordered)
     positives: list[tuple[np.ndarray, np.ndarray, str, str]] = []
@@ -115,6 +129,8 @@ def build_v2_pair_set(sessions: Sequence[SessionEmbedding]) -> V2PairSet:
             PairMetadata,
         ]
     ] = []
+    mismatch_evidence = _human_mismatch_evidence_by_session(human_mismatch_evidence)
+    used_evidence_keys: set[tuple[str, str]] = set()
 
     by_student: dict[str, list[SessionEmbedding]] = defaultdict(list)
     for session in ordered:
@@ -128,11 +144,19 @@ def build_v2_pair_set(sessions: Sequence[SessionEmbedding]) -> V2PairSet:
             positives.append((ref, photo, session.student_id, session.session_id))
             by_student[session.student_id].append(session)
         elif session.label == "mismatch":
+            evidence_key = (session.student_id, session.session_id)
+            evidence = mismatch_evidence.get(evidence_key)
+            if evidence is None:
+                raise ValueError(
+                    "human mismatch evidence is required for "
+                    f"{session.student_id}/{session.session_id}"
+                )
+            used_evidence_keys.add(evidence_key)
             metadata = PairMetadata(
                 ref_student_id=session.student_id,
                 ref_session_id=session.session_id,
-                photo_student_id=session.student_id,
-                photo_session_id=session.session_id,
+                photo_student_id=evidence.photo_student_token,
+                photo_session_id=evidence.photo_session_token,
                 label=0,
                 raw_cosine=float(np.dot(ref, photo)),
             )
@@ -141,25 +165,26 @@ def build_v2_pair_set(sessions: Sequence[SessionEmbedding]) -> V2PairSet:
                     (
                         session.student_id,
                         session.session_id,
-                        session.student_id,
-                        session.session_id,
+                        evidence.photo_student_token,
+                        evidence.photo_session_token,
                         _PAIR_CATEGORY_ORDER["human_mismatch"],
                     ),
                     ref,
                     photo,
-                    _group_id(
-                        "human_mismatch",
-                        session.student_id,
-                        session.session_id,
-                        session.student_id,
-                        session.session_id,
-                    ),
+                    evidence.ordered_pair_token,
                     "human_mismatch",
                     metadata,
                 )
             )
         else:
             raise ValueError(f"invalid session label: {session.label!r}")
+    unused_keys = set(mismatch_evidence) - used_evidence_keys
+    if unused_keys:
+        student_id, session_id = min(unused_keys)
+        raise ValueError(
+            "human mismatch evidence does not match any mismatch session: "
+            f"{student_id}/{session_id}"
+        )
 
     students = sorted(by_student)
     for ref_student in students:
@@ -229,6 +254,17 @@ def build_v2_pair_set(sessions: Sequence[SessionEmbedding]) -> V2PairSet:
         negative_categories=negative_categories,
         negative_weights=_weights_for_groups(negative_group_ids),
         negative_metadata=negative_metadata,
+    )
+
+
+def build_v2_pair_set(
+    sessions: Sequence[SessionEmbedding],
+    *,
+    human_mismatch_evidence: Sequence[HumanMismatchEvidence] = (),
+) -> V2PairSet:
+    return _build_v2_pair_set(
+        sessions,
+        human_mismatch_evidence=human_mismatch_evidence,
     )
 
 
@@ -511,10 +547,7 @@ def _validate_group_metadata(
         else:
             signature = (
                 category,
-                pair.ref_student_id,
-                pair.ref_session_id,
                 pair.photo_student_id,
-                pair.photo_session_id,
             )
         previous = expected.setdefault(group_id, signature)
         if previous != signature:
@@ -549,14 +582,10 @@ def _bootstrap_far_grid(
     seed = bootstrap_seed(dataset_digest)
     generator = np.random.default_rng(seed)
     group_count = len(group_scores)
-    sample_counts = generator.multinomial(
-        group_count,
-        np.full(group_count, 1.0 / group_count, dtype=np.float64),
-        size=iterations,
-    )
-    sampled_sizes = sample_counts @ group_sizes
     upper_95 = np.empty(thresholds.shape, dtype=np.float64)
     block = 128
+    retain_count = iterations - int(math.ceil((iterations - 1) * 0.95))
+    block_states: list[tuple[slice, np.ndarray, np.ndarray]] = []
     for start in range(0, len(thresholds), block):
         end = min(start + block, len(thresholds))
         accept_matrix = np.vstack(
@@ -564,15 +593,29 @@ def _bootstrap_far_grid(
                 scores.size - np.searchsorted(scores, thresholds[start:end], side="left")
                 for scores in group_scores
             ]
-        ).astype(np.int64, copy=False)
-        sampled_accepts = sample_counts @ accept_matrix
-        replicates = sampled_accepts / sampled_sizes[:, None]
-        upper_95[start:end] = np.quantile(
-            replicates,
-            0.95,
-            axis=0,
-            method="higher",
+        ).astype(np.int32, copy=False)
+        block_states.append(
+            (
+                slice(start, end),
+                accept_matrix,
+                np.full((retain_count, end - start), -np.inf, dtype=np.float64),
+            )
         )
+    for sample_counts in _iter_bootstrap_sample_counts(
+        generator,
+        group_count=group_count,
+        iterations=iterations,
+        batch_size=_BOOTSTRAP_DRAW_BATCH_SIZE,
+    ):
+        sampled_sizes = sample_counts @ group_sizes
+        for block_slice, accept_matrix, top_values in block_states:
+            sampled_accepts = sample_counts @ accept_matrix
+            replicates = sampled_accepts / sampled_sizes[:, None]
+            top_values[...] = _top_k_higher_quantile_values(
+                top_values, replicates, retain_count
+            )
+    for block_slice, _accept_matrix, top_values in block_states:
+        upper_95[block_slice] = np.min(top_values, axis=0)
     return _BootstrapGrid(
         empirical_far=np.asarray(empirical_far, dtype=np.float64),
         upper_95=upper_95,
@@ -580,6 +623,53 @@ def _bootstrap_far_grid(
         seed=seed,
         group_count=group_count,
     )
+
+
+def _human_mismatch_evidence_by_session(
+    human_mismatch_evidence: Sequence[HumanMismatchEvidence],
+) -> dict[tuple[str, str], HumanMismatchEvidence]:
+    evidence_by_session: dict[tuple[str, str], HumanMismatchEvidence] = {}
+    for item in human_mismatch_evidence:
+        key = (item.student_id, item.session_id)
+        if not item.ordered_pair_token:
+            raise ValueError("human mismatch evidence ordered_pair_token must be non-empty")
+        if not item.photo_student_token or not item.photo_session_token:
+            raise ValueError(
+                "human mismatch evidence photo tokens must be non-empty"
+            )
+        previous = evidence_by_session.setdefault(key, item)
+        if previous != item:
+            raise ValueError("duplicate human mismatch evidence for one session")
+    return evidence_by_session
+
+
+def _iter_bootstrap_sample_counts(
+    generator: np.random.Generator,
+    *,
+    group_count: int,
+    iterations: int,
+    batch_size: int,
+) -> Iterator[np.ndarray]:
+    if group_count <= 0:
+        raise ValueError("group_count must be positive")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    probabilities = np.full(group_count, 1.0 / group_count, dtype=np.float64)
+    remaining = iterations
+    while remaining > 0:
+        count = min(batch_size, remaining)
+        yield generator.multinomial(group_count, probabilities, size=count)
+        remaining -= count
+
+
+def _top_k_higher_quantile_values(
+    current: np.ndarray,
+    new_values: np.ndarray,
+    keep: int,
+) -> np.ndarray:
+    combined = np.concatenate((current, new_values), axis=0)
+    partitioned = np.partition(combined, combined.shape[0] - keep, axis=0)
+    return partitioned[-keep:, :]
 
 
 def _grouped_negative_scores(
