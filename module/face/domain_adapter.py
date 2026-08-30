@@ -19,6 +19,13 @@ _SCHEMA_VERSION = 1
 _EMBEDDING_DIMENSION = 128
 _INPUT_NAMES = ("ref_embedding", "photo_embedding")
 _OUTPUT_NAME = "adapted_cosine"
+_ARTIFACT_INVALID = "adapter_artifact_invalid"
+_LOAD_FAILED = "adapter_load_failed"
+_INFERENCE_FAILED = "adapter_inference_failed"
+
+
+class _ArtifactValidationError(Exception):
+    """Private marker for known-bad, externally supplied artifact contracts."""
 
 
 @dataclass(frozen=True)
@@ -127,11 +134,11 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise ValueError("adapter manifest is missing") from exc
+        raise _ArtifactValidationError from exc
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("adapter manifest is unreadable") from exc
+        raise _ArtifactValidationError from exc
     if not isinstance(payload, dict):
-        raise ValueError("adapter manifest root must be an object")
+        raise _ArtifactValidationError
     return payload
 
 
@@ -139,17 +146,17 @@ def _validate_manifest(
     manifest: dict[str, Any], onnx_path: Path
 ) -> tuple[str, str, float]:
     if manifest.get("schema_version") != _SCHEMA_VERSION:
-        raise ValueError("adapter manifest schema version is unsupported")
+        raise _ArtifactValidationError
 
     version = manifest.get("model_version")
     if not isinstance(version, str) or not version.strip():
-        raise ValueError("adapter manifest model version is invalid")
+        raise _ArtifactValidationError
     if manifest.get("embedding_dimension") != _EMBEDDING_DIMENSION:
-        raise ValueError("adapter manifest embedding dimension is invalid")
+        raise _ArtifactValidationError
 
     rank = manifest.get("rank")
     if isinstance(rank, bool) or not isinstance(rank, int) or not 0 < rank <= _EMBEDDING_DIMENSION:
-        raise ValueError("adapter manifest rank is invalid")
+        raise _ArtifactValidationError
 
     threshold = manifest.get("match_threshold")
     if (
@@ -158,23 +165,23 @@ def _validate_manifest(
         or not math.isfinite(float(threshold))
         or not -1.0 <= float(threshold) <= 1.0
     ):
-        raise ValueError("adapter manifest match threshold is invalid")
+        raise _ArtifactValidationError
 
     declared_file = manifest.get("onnx_file")
     if declared_file != onnx_path.name:
-        raise ValueError("adapter manifest ONNX file is invalid")
+        raise _ArtifactValidationError
     sha256 = manifest.get("onnx_sha256")
     if not isinstance(sha256, str) or len(sha256) != 64:
-        raise ValueError("adapter manifest checksum is invalid")
+        raise _ArtifactValidationError
     try:
         int(sha256, 16)
     except ValueError as exc:
-        raise ValueError("adapter manifest checksum is invalid") from exc
+        raise _ArtifactValidationError from exc
 
     if manifest.get("input_names") != list(_INPUT_NAMES):
-        raise ValueError("adapter manifest input names are invalid")
+        raise _ArtifactValidationError
     if manifest.get("output_name") != _OUTPUT_NAME:
-        raise ValueError("adapter manifest output name is invalid")
+        raise _ArtifactValidationError
     return version.strip(), sha256.lower(), float(threshold)
 
 
@@ -182,9 +189,9 @@ def _verify_checksum(onnx_path: Path, expected: str) -> None:
     try:
         actual = hashlib.sha256(onnx_path.read_bytes()).hexdigest()
     except OSError as exc:
-        raise ValueError("adapter ONNX artifact is unreadable") from exc
+        raise _ArtifactValidationError from exc
     if actual != expected:
-        raise ValueError("adapter ONNX checksum mismatch")
+        raise _ArtifactValidationError
 
 
 def _validate_graph_io(session: Any) -> None:
@@ -192,17 +199,23 @@ def _validate_graph_io(session: Any) -> None:
         inputs = session.get_inputs()
         outputs = session.get_outputs()
     except Exception as exc:
-        raise ValueError("adapter graph metadata is unreadable") from exc
+        raise _ArtifactValidationError from exc
 
     if len(inputs) != 2 or tuple(item.name for item in inputs) != _INPUT_NAMES:
-        raise ValueError("adapter graph input contract is invalid")
+        raise _ArtifactValidationError
     if len(outputs) != 1 or outputs[0].name != _OUTPUT_NAME:
-        raise ValueError("adapter graph output contract is invalid")
+        raise _ArtifactValidationError
     for item in inputs:
-        if not _is_embedding_shape(getattr(item, "shape", None)):
-            raise ValueError("adapter graph input shape is invalid")
-    if not _is_score_shape(getattr(outputs[0], "shape", None)):
-        raise ValueError("adapter graph output shape is invalid")
+        if (
+            getattr(item, "type", None) != "tensor(float)"
+            or not _is_embedding_shape(getattr(item, "shape", None))
+        ):
+            raise _ArtifactValidationError
+    if (
+        getattr(outputs[0], "type", None) != "tensor(float)"
+        or not _is_score_shape(getattr(outputs[0], "shape", None))
+    ):
+        raise _ArtifactValidationError
 
 
 def _is_embedding_shape(shape: Any) -> bool:
@@ -253,12 +266,10 @@ def _read_score(output: Any) -> float:
 
 
 def _safe_load_error(exc: Exception) -> str:
-    if isinstance(exc, ValueError):
-        return str(exc)
-    return f"adapter load failed: {type(exc).__name__}"
+    if isinstance(exc, _ArtifactValidationError):
+        return _ARTIFACT_INVALID
+    return _LOAD_FAILED
 
 
 def _safe_inference_error(exc: Exception) -> str:
-    if isinstance(exc, ValueError):
-        return str(exc)
-    return f"adapter inference failed: {type(exc).__name__}"
+    return _INFERENCE_FAILED

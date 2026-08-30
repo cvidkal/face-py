@@ -22,17 +22,21 @@ class _AdapterSession:
         *,
         input_names: tuple[str, str] = ("ref_embedding", "photo_embedding"),
         input_shapes: tuple[object, object] = (["N", 128], ["N", 128]),
+        input_types: tuple[str, str] = ("tensor(float)", "tensor(float)"),
         output_name: str = "adapted_cosine",
         output_shape: object = ["N"],
+        output_type: str = "tensor(float)",
         error: Exception | None = None,
     ) -> None:
         self.output = output
         self.error = error
         self._inputs = [
-            SimpleNamespace(name=name, shape=shape)
-            for name, shape in zip(input_names, input_shapes)
+            SimpleNamespace(name=name, shape=shape, type=value_type)
+            for name, shape, value_type in zip(input_names, input_shapes, input_types)
         ]
-        self._outputs = [SimpleNamespace(name=output_name, shape=output_shape)]
+        self._outputs = [
+            SimpleNamespace(name=output_name, shape=output_shape, type=output_type)
+        ]
         self.last_inputs: dict[str, np.ndarray] | None = None
 
     def get_inputs(self) -> list[SimpleNamespace]:
@@ -82,7 +86,7 @@ class DomainAdapterRuntimeTests(unittest.TestCase):
                 runtime = DomainAdapterRuntime.load("shadow", onnx_path)
 
         self.assertFalse(runtime.ready)
-        self.assertIn("checksum", runtime.load_error)
+        self.assertEqual(runtime.load_error, "adapter_artifact_invalid")
         factory.assert_not_called()
 
     def test_manifest_contract_is_validated_before_session_creation(self) -> None:
@@ -108,7 +112,48 @@ class DomainAdapterRuntimeTests(unittest.TestCase):
                 runtime = DomainAdapterRuntime.load("active", onnx_path)
 
         self.assertFalse(runtime.ready)
-        self.assertIn("input", runtime.load_error)
+        self.assertEqual(runtime.load_error, "adapter_artifact_invalid")
+
+    def test_graph_shape_contract_is_validated_before_runtime_is_ready(self) -> None:
+        session = _AdapterSession(input_shapes=(["N", 127], ["N", 128]))
+        with self._artifact() as onnx_path:
+            with patch("module.face.domain_adapter.ort.InferenceSession", return_value=session):
+                runtime = DomainAdapterRuntime.load("active", onnx_path)
+
+        self.assertFalse(runtime.ready)
+        self.assertFalse(runtime.compare(self.ref, self.photo).usable)
+
+    def test_graph_dtype_contract_is_validated_before_runtime_is_ready(self) -> None:
+        session = _AdapterSession(input_types=("tensor(int64)", "tensor(float)"))
+        with self._artifact() as onnx_path:
+            with patch("module.face.domain_adapter.ort.InferenceSession", return_value=session):
+                runtime = DomainAdapterRuntime.load("active", onnx_path)
+
+        self.assertFalse(runtime.ready)
+        self.assertEqual(runtime.load_error, "adapter_artifact_invalid")
+        self.assertFalse(runtime.compare(self.ref, self.photo).usable)
+
+    def test_graph_output_dtype_contract_is_validated_before_runtime_is_ready(self) -> None:
+        session = _AdapterSession(output_type="tensor(double)")
+        with self._artifact() as onnx_path:
+            with patch("module.face.domain_adapter.ort.InferenceSession", return_value=session):
+                runtime = DomainAdapterRuntime.load("active", onnx_path)
+
+        self.assertFalse(runtime.ready)
+        self.assertEqual(runtime.load_error, "adapter_artifact_invalid")
+
+    def test_load_error_redacts_provider_exception_details(self) -> None:
+        sentinel = "SENTINEL_SECRET /models/private/provider"
+        with self._artifact() as onnx_path:
+            with patch(
+                "module.face.domain_adapter.ort.InferenceSession",
+                side_effect=ValueError(sentinel),
+            ):
+                runtime = DomainAdapterRuntime.load("active", onnx_path)
+
+        self.assertFalse(runtime.ready)
+        self.assertEqual(runtime.load_error, "adapter_load_failed")
+        self.assertNotIn(sentinel, runtime.load_error)
 
     def test_loads_valid_artifact_and_classifies_finite_score(self) -> None:
         session = _AdapterSession(output=np.asarray([0.76], dtype=np.float32))
@@ -133,9 +178,9 @@ class DomainAdapterRuntimeTests(unittest.TestCase):
         non_finite = runtime.compare(np.full(128, np.nan, dtype=np.float32), self.photo)
 
         self.assertFalse(wrong_shape.usable)
-        self.assertIn("shape", wrong_shape.error)
+        self.assertEqual(wrong_shape.error, "adapter_inference_failed")
         self.assertFalse(non_finite.usable)
-        self.assertIn("non-finite", non_finite.error)
+        self.assertEqual(non_finite.error, "adapter_inference_failed")
 
     def test_inputs_are_l2_normalized_before_inference(self) -> None:
         session = _AdapterSession()
@@ -157,19 +202,31 @@ class DomainAdapterRuntimeTests(unittest.TestCase):
         decision = runtime.compare(self.ref, self.photo)
 
         self.assertFalse(decision.usable)
-        self.assertIn("non-finite", decision.error)
+        self.assertEqual(decision.error, "adapter_inference_failed")
 
     def test_inference_exception_and_wrong_output_shape_return_fallback(self) -> None:
-        failing = self._loaded_runtime(_AdapterSession(error=RuntimeError("provider failure")))
+        sentinel = "SENTINEL_SECRET /models/private/provider"
+        failing = self._loaded_runtime(_AdapterSession(error=RuntimeError(sentinel)))
         malformed = self._loaded_runtime(_AdapterSession(output=np.asarray([[0.7]], dtype=np.float32)))
 
         inference = failing.compare(self.ref, self.photo)
         output = malformed.compare(self.ref, self.photo)
 
         self.assertFalse(inference.usable)
-        self.assertIn("inference", inference.error)
+        self.assertEqual(inference.error, "adapter_inference_failed")
+        self.assertNotIn(sentinel, inference.error)
         self.assertFalse(output.usable)
-        self.assertIn("output", output.error)
+        self.assertEqual(output.error, "adapter_inference_failed")
+
+    def test_conversion_error_redacts_input_details(self) -> None:
+        sentinel = "SENTINEL_SECRET embedding contents"
+        runtime = self._loaded_runtime(_AdapterSession())
+
+        decision = runtime.compare(_SecretEmbedding(sentinel), self.photo)
+
+        self.assertFalse(decision.usable)
+        self.assertEqual(decision.error, "adapter_inference_failed")
+        self.assertNotIn(sentinel, decision.error)
 
     def test_environment_loader_defaults_to_off_and_preserves_invalid_mode_error(self) -> None:
         old_mode = os.environ.pop("FACE_DOMAIN_ADAPTER_MODE", None)
@@ -238,6 +295,14 @@ class _Artifact:
     def __exit__(self, *unused: object) -> None:
         assert self._temporary_directory is not None
         self._temporary_directory.cleanup()
+
+
+class _SecretEmbedding:
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
+
+    def __array__(self, dtype: object = None) -> np.ndarray:
+        raise ValueError(self._secret)
 
 
 if __name__ == "__main__":
