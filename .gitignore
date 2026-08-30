@@ -22,6 +22,7 @@ dist/
 
 # Claude harness
 .claude/
+.worktrees/
 
 # Models (>5MB, ship via separate download or docker bake)
 models/*.onnx
