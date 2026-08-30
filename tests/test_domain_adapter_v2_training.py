@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -12,11 +14,24 @@ from tools.domain_adapter_training import (
     PairMetadata,
     SessionEmbedding,
 )
-from tools.domain_adapter_v2_metrics import V2PairSet, build_v2_pair_set
+from tools.domain_adapter_v2_metrics import (
+    CalibratedThreshold,
+    V2PairSet,
+    build_v2_pair_set,
+    student_fold,
+)
 from tools.domain_adapter_v2_training import (
+    FoldEpochMetrics,
+    InsufficientDataError,
+    NoFeasibleEpochError,
+    TrainingTrace,
+    V2EpochLoss,
+    V2Selection,
     V2TrainingConfig,
     score_pair_set,
+    select_v2_epoch,
     train_fold_epoch,
+    train_v2_candidate,
     v2_separation_loss,
 )
 
@@ -384,6 +399,359 @@ class V2ObjectiveTests(unittest.TestCase):
             model.photo_tower.up.weight.zero_()
             model.photo_tower.down.weight[0, 1] = 1.0
             model.photo_tower.up.weight[0, 0] = scale
+
+
+class V2EpochSelectionTests(unittest.TestCase):
+    def test_select_v2_epoch_prefers_feasible_epoch_by_recall_then_tie_breakers(self) -> None:
+        history = tuple(
+            self._epoch_history(2, recalls=(0.90, 0.90, 0.90, 0.90, 0.90), threshold=0.349)
+            + self._epoch_history(3, recalls=(0.72, 0.72, 0.72, 0.70, 0.69))
+            + self._epoch_history(4, recalls=(0.72, 0.72, 0.72, 0.70, 0.70))
+            + self._epoch_history(
+                6,
+                recalls=(0.72, 0.72, 0.72, 0.70, 0.70),
+                residual_drift=0.03,
+            )
+            + self._epoch_history(
+                7,
+                recalls=(0.72, 0.72, 0.72, 0.70, 0.70),
+                validation_loss=0.08,
+            )
+            + self._epoch_history(8, recalls=(0.72, 0.72, 0.72, 0.70, 0.70))
+        )
+
+        selection = select_v2_epoch(history, dataset_digest="0" * 64)
+
+        self.assertEqual(selection.epoch, 4)
+        self.assertEqual(selection.median_recall, 0.72)
+        self.assertEqual(selection.worst_fold_recall, 0.70)
+        self.assertLessEqual(selection.pooled_far_upper_95, 0.01)
+
+    def test_select_v2_epoch_raises_when_no_epoch_is_feasible(self) -> None:
+        history = tuple(
+            self._epoch_history(1, recalls=(0.80, 0.80, 0.80, 0.80, 0.80), empirical_far=0.006)
+            + self._epoch_history(2, recalls=(0.90, 0.90, 0.90, 0.90, 0.90), threshold=0.349)
+        )
+
+        with self.assertRaises(NoFeasibleEpochError):
+            select_v2_epoch(history, dataset_digest="1" * 64)
+
+    @staticmethod
+    def _epoch_history(
+        epoch: int,
+        *,
+        recalls: tuple[float, float, float, float, float],
+        threshold: float = 0.35,
+        empirical_far: float = 0.0,
+        residual_drift: float = 0.02,
+        validation_loss: float = 0.05,
+    ) -> list[FoldEpochMetrics]:
+        records: list[FoldEpochMetrics] = []
+        for fold, recall in enumerate(recalls):
+            records.append(
+                FoldEpochMetrics(
+                    fold=fold,
+                    epoch=epoch,
+                    candidate_threshold=threshold,
+                    empirical_far=empirical_far,
+                    student_balanced_recall=recall,
+                    validation_loss=validation_loss,
+                    residual_drift=residual_drift,
+                    negative_group_ids=tuple(
+                        f"epoch-{epoch}-fold-{fold}-group-{index:03d}" for index in range(200)
+                    ),
+                    negative_accepts=(False,) * 200,
+                )
+            )
+        return records
+
+
+class V2CandidateTrainingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.cache_dir = Path(self.tempdir.name)
+        self.config = V2TrainingConfig()
+        self.training_students = self._students_for_all_folds(20)
+        self.validation_students = tuple(f"validation-{index:03d}" for index in range(33))
+        self.training_sessions = tuple(
+            self._session(student_id, split="train")
+            for student_id in self.training_students
+        )
+        self.validation_sessions = tuple(
+            self._session(student_id, split="validation")
+            for student_id in self.validation_students
+        )
+        self.all_sessions = self.training_sessions + self.validation_sessions
+        self.manifest = self._manifest(
+            train_students=self.training_students,
+            validation_students=self.validation_students,
+        )
+        self.small_manifest = self._manifest(
+            train_students=tuple(f"tiny-{index:03d}" for index in range(19)),
+            validation_students=self.validation_students,
+        )
+
+    def test_cross_validation_rejects_small_folds_before_training(self) -> None:
+        with patch(
+            "tools.domain_adapter_v2_training.extract_session_embeddings",
+            return_value=list(self._sessions_from_manifest(self.small_manifest)),
+        ):
+            with self.assertRaisesRegex(InsufficientDataError, "20 students"):
+                train_v2_candidate(
+                    self.small_manifest,
+                    self.cache_dir,
+                    self.config,
+                    seed=20260830,
+                    device="cpu",
+                )
+
+    def test_validation_students_never_enter_fold_training_or_selection(self) -> None:
+        trace = TrainingTrace()
+        loaded_manifests: list[dict[str, object]] = []
+
+        def fake_extract(manifest: dict[str, object], *, cache_path: Path):
+            loaded_manifests.append(manifest)
+            self.assertEqual(cache_path, self.cache_dir / ".embedding-cache.npz")
+            return list(self._sessions_from_manifest(manifest))
+
+        with patch(
+            "tools.domain_adapter_v2_training.extract_session_embeddings",
+            side_effect=fake_extract,
+        ):
+            with patch(
+                "tools.domain_adapter_v2_training.train_fold_epoch",
+                side_effect=self._fake_train_fold_epoch,
+            ):
+                with patch(
+                    "tools.domain_adapter_v2_training.score_pair_set",
+                    side_effect=self._fake_score_pair_set,
+                ):
+                    with patch(
+                        "tools.domain_adapter_v2_training.calibrate_threshold",
+                        side_effect=self._fake_calibrate_threshold,
+                    ):
+                        with patch(
+                            "tools.domain_adapter_v2_training.v2_separation_loss",
+                            side_effect=self._fake_v2_loss,
+                        ):
+                            with patch(
+                                "tools.domain_adapter_v2_training.select_v2_epoch",
+                                return_value=V2Selection(
+                                    epoch=3,
+                                    median_recall=1.0,
+                                    worst_fold_recall=1.0,
+                                    pooled_far_upper_95=0.0,
+                                    residual_drift=0.01,
+                                    validation_loss=0.0,
+                                ),
+                            ):
+                                result = train_v2_candidate(
+                                    self.manifest,
+                                    self.cache_dir,
+                                    self.config,
+                                    seed=20260830,
+                                    device="cpu",
+                                    trace=trace,
+                                )
+
+        self.assertIsNotNone(result.selection)
+        self.assertTrue(trace.trained_fold_students.isdisjoint(self.validation_students))
+        self.assertTrue(trace.selection_students.isdisjoint(self.validation_students))
+        self.assertEqual(trace.final_training_students, set(self.training_students))
+        self.assertEqual(trace.final_epoch_count, result.selection.epoch)
+        self.assertEqual(loaded_manifests[0]["evaluation_sessions"], [])
+        loaded_students = {
+            str(row["student_id"])
+            for row in loaded_manifests[0]["sessions"]  # type: ignore[index]
+        }
+        self.assertFalse(any(student.startswith("evaluation-") for student in loaded_students))
+        self.assertFalse(any(student.startswith("excluded-") for student in loaded_students))
+
+    def test_validation_requires_at_least_one_thousand_ordered_groups(self) -> None:
+        manifest = self._manifest(
+            train_students=self.training_students,
+            validation_students=tuple(f"small-validation-{index:03d}" for index in range(20)),
+        )
+
+        with patch(
+            "tools.domain_adapter_v2_training.extract_session_embeddings",
+            return_value=list(self._sessions_from_manifest(manifest)),
+        ):
+            with patch(
+                "tools.domain_adapter_v2_training.train_fold_epoch",
+                side_effect=self._fake_train_fold_epoch,
+            ):
+                with patch(
+                    "tools.domain_adapter_v2_training.score_pair_set",
+                    side_effect=self._fake_score_pair_set,
+                ):
+                    with patch(
+                        "tools.domain_adapter_v2_training.v2_separation_loss",
+                        side_effect=self._fake_v2_loss,
+                    ):
+                        with self.assertRaisesRegex(
+                            InsufficientDataError,
+                            "1000 ordered groups",
+                        ):
+                            train_v2_candidate(
+                                manifest,
+                                self.cache_dir,
+                                self.config,
+                                seed=20260830,
+                                device="cpu",
+                            )
+
+    @staticmethod
+    def _session(student_id: str, *, split: str) -> SessionEmbedding:
+        vector = _normalized(
+            (
+                1.0,
+                (int(student_id.encode("utf-8").hex(), 16) % 7 + 1) / 10.0,
+            )
+        )
+        return SessionEmbedding(
+            student_id=student_id,
+            session_id="session-1",
+            split=split,
+            label="match",
+            ref_embedding=vector,
+            session_prototype=vector,
+        )
+
+    @staticmethod
+    def _students_for_all_folds(count_per_fold: int) -> tuple[str, ...]:
+        buckets: dict[int, list[str]] = {fold: [] for fold in range(5)}
+        index = 0
+        while any(len(bucket) < count_per_fold for bucket in buckets.values()):
+            student_id = f"train-{index:04d}"
+            fold = student_fold(student_id)
+            if len(buckets[fold]) < count_per_fold:
+                buckets[fold].append(student_id)
+            index += 1
+        return tuple(student for fold in range(5) for student in buckets[fold])
+
+    @staticmethod
+    def _manifest(
+        *,
+        train_students: tuple[str, ...],
+        validation_students: tuple[str, ...],
+    ) -> dict[str, object]:
+        def row(student_id: str, split: str, *, reasons: list[str] | None = None) -> dict[str, object]:
+            item: dict[str, object] = {
+                "student_id": student_id,
+                "session_id": "session-1",
+                "split": split,
+                "label": "match",
+                "ref_image_path": f"/{student_id}/ref.jpg",
+                "photos": [{"sequence_no": 1, "image_path": f"/{student_id}/photo.jpg"}],
+            }
+            if reasons is not None:
+                item["training_exclusion_reasons"] = reasons
+            return item
+
+        sessions = [row(student_id, "train") for student_id in train_students]
+        sessions.extend(row(student_id, "validation") for student_id in validation_students)
+        sessions.append(row("excluded-student", "train", reasons=["photo_error"]))
+        return {
+            "schema_version": 1,
+            "snapshot": "2026-08-30T12:00:00+00:00",
+            "split_seed": "seed-v2",
+            "sessions": sessions,
+            "evaluation_sessions": [row("evaluation-student", "test", reasons=["test_split"])],
+        }
+
+    @staticmethod
+    def _sessions_from_manifest(manifest: dict[str, object]) -> tuple[SessionEmbedding, ...]:
+        sessions: list[SessionEmbedding] = []
+        for row in manifest["sessions"]:  # type: ignore[index]
+            vector = _normalized(
+                (
+                    1.0,
+                    (int(str(row["student_id"]).encode("utf-8").hex(), 16) % 7 + 1) / 10.0,
+                )
+            )
+            sessions.append(
+                SessionEmbedding(
+                    student_id=str(row["student_id"]),
+                    session_id=str(row["session_id"]),
+                    split=str(row["split"]),
+                    label=str(row["label"]),
+                    ref_embedding=vector,
+                    session_prototype=vector,
+                )
+            )
+        return tuple(sessions)
+
+    @staticmethod
+    def _fake_train_fold_epoch(
+        _model: LowRankDomainAdapter,
+        _optimizer: torch.optim.Optimizer,
+        pair_set: V2PairSet,
+        _config: V2TrainingConfig,
+    ) -> V2EpochLoss:
+        return V2EpochLoss(
+            total=0.1,
+            positive=0.02,
+            negative=0.03,
+            ranking=0.04,
+            identity=0.0,
+            residual_drift=0.01 + len(set(pair_set.positive_student_ids)) * 1e-6,
+        )
+
+    @staticmethod
+    def _fake_score_pair_set(
+        _model: LowRankDomainAdapter,
+        pair_set: V2PairSet,
+        _device: str,
+    ):
+        return type(
+            "Scores",
+            (),
+            {
+                "positive": np.full(len(pair_set.positive_student_ids), 0.80, dtype=np.float64),
+                "negative": np.zeros(len(pair_set.negative_group_ids), dtype=np.float64),
+            },
+        )()
+
+    @staticmethod
+    def _fake_v2_loss(
+        _model: LowRankDomainAdapter,
+        _pair_set: V2PairSet,
+        _config: V2TrainingConfig,
+    ):
+        zero = torch.tensor(0.0)
+        return type(
+            "Loss",
+            (),
+            {
+                "total": zero,
+                "positive": zero,
+                "negative": zero,
+                "ranking": zero,
+                "identity": zero,
+                "hard_negative_indices": torch.empty((0,), dtype=torch.int64),
+            },
+        )()
+
+    @staticmethod
+    def _fake_calibrate_threshold(
+        *,
+        positive_scores: np.ndarray,
+        positive_student_ids: tuple[str, ...],
+        negative_scores: np.ndarray,
+        negative_group_ids: tuple[str, ...],
+        dataset_digest: str,
+    ) -> CalibratedThreshold:
+        del negative_scores, negative_group_ids, dataset_digest
+        return CalibratedThreshold(
+            threshold=0.35,
+            empirical_far=0.0,
+            far_upper_95=0.0,
+            student_balanced_recall=1.0 if len(positive_scores) == len(positive_student_ids) else 0.0,
+            true_matches=len(positive_scores),
+            feasible=True,
+        )
 
 
 if __name__ == "__main__":
