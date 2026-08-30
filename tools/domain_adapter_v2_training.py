@@ -93,7 +93,7 @@ def score_pair_set(
     _validate_model(model)
     model_device = _model_device(model)
     requested_device = _requested_device(device)
-    if requested_device != model_device:
+    if _canonical_device_key(requested_device) != _canonical_device_key(model_device):
         raise ValueError(
             f"requested device {requested_device} does not match model device {model_device}"
         )
@@ -270,6 +270,23 @@ def _requested_device(device: str) -> torch.device:
         return torch.device(device)
     except (TypeError, RuntimeError, ValueError) as exc:
         raise ValueError(f"invalid device {device!r}") from exc
+
+
+def _canonical_device_key(device: torch.device) -> tuple[str, int | None]:
+    if device.type == "cpu":
+        return ("cpu", None)
+    if device.type == "cuda":
+        return ("cuda", _resolved_cuda_index(device))
+    return (device.type, device.index)
+
+
+def _resolved_cuda_index(device: torch.device) -> int:
+    if device.index is not None:
+        return int(device.index)
+    try:
+        return int(torch.cuda.current_device())
+    except (AssertionError, RuntimeError) as exc:
+        raise ValueError("cuda device index is unavailable") from exc
 
 
 def _embedding_tensor(

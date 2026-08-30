@@ -73,6 +73,31 @@ class V2ObjectiveTests(unittest.TestCase):
         self.assertAlmostEqual(float(scores.negative[0]), 0.95, places=6)
         self.assertTrue(np.allclose(scores.negative[1:], 0.50, atol=1e-6))
 
+    def test_score_pair_set_accepts_cpu_alias_with_index(self) -> None:
+        scores = score_pair_set(self.model, self.pairs, "cpu:0")
+
+        self.assertAlmostEqual(float(scores.positive[0]), 0.55, places=6)
+        self.assertAlmostEqual(float(scores.negative[0]), 0.95, places=6)
+
+    def test_score_pair_set_accepts_bare_cuda_alias_for_current_index(self) -> None:
+        def fake_tensor(values, **_kwargs) -> torch.Tensor:
+            return torch.from_numpy(np.asarray(values, dtype=np.float32))
+
+        with patch("tools.domain_adapter_v2_training._model_device", return_value=torch.device("cuda:3")):
+            with patch(
+                "tools.domain_adapter_v2_training.torch.cuda.current_device",
+                return_value=3,
+            ):
+                with patch(
+                    "tools.domain_adapter_v2_training._embedding_tensor",
+                    side_effect=fake_tensor,
+                ) as embedding_tensor:
+                    scores = score_pair_set(self.model, self.pairs, "cuda")
+
+        self.assertAlmostEqual(float(scores.positive[0]), 0.55, places=6)
+        self.assertAlmostEqual(float(scores.negative[0]), 0.95, places=6)
+        self.assertEqual(embedding_tensor.call_count, 4)
+
     def test_score_pair_set_rejects_requested_device_mismatch_before_allocating_inputs(
         self,
     ) -> None:
@@ -82,6 +107,18 @@ class V2ObjectiveTests(unittest.TestCase):
                 "requested device meta does not match model device cpu",
             ):
                 score_pair_set(self.model, self.pairs, "meta")
+        embedding_tensor.assert_not_called()
+
+    def test_score_pair_set_rejects_true_device_mismatch_after_canonicalization(
+        self,
+    ) -> None:
+        with patch("tools.domain_adapter_v2_training._model_device", return_value=torch.device("meta")):
+            with patch("tools.domain_adapter_v2_training._embedding_tensor") as embedding_tensor:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "requested device cpu:0 does not match model device meta",
+                ):
+                    score_pair_set(self.model, self.pairs, "cpu:0")
         embedding_tensor.assert_not_called()
 
     def test_ranking_uses_top_ten_current_scores_sharing_the_reference(self) -> None:
