@@ -73,11 +73,49 @@ class V2ObjectiveTests(unittest.TestCase):
         self.assertAlmostEqual(float(scores.negative[0]), 0.95, places=6)
         self.assertTrue(np.allclose(scores.negative[1:], 0.50, atol=1e-6))
 
+    def test_score_pair_set_rejects_requested_device_mismatch_before_allocating_inputs(
+        self,
+    ) -> None:
+        with patch("tools.domain_adapter_v2_training._embedding_tensor") as embedding_tensor:
+            with self.assertRaisesRegex(
+                ValueError,
+                "requested device meta does not match model device cpu",
+            ):
+                score_pair_set(self.model, self.pairs, "meta")
+        embedding_tensor.assert_not_called()
+
     def test_ranking_uses_top_ten_current_scores_sharing_the_reference(self) -> None:
         loss = v2_separation_loss(self.model, self.pairs, self.config)
 
         self.assertGreater(loss.ranking.item(), 0.0)
         self.assertEqual(loss.hard_negative_indices.tolist(), self.expected_top_ten)
+
+    def test_ranking_uses_current_adapted_scores_and_preserves_ranking_gradients(
+        self,
+    ) -> None:
+        model = LowRankDomainAdapter(dimension=2, rank=16)
+        self._configure_photo_tower_x_from_y(model, scale=1.0)
+        ranking_only = V2TrainingConfig(
+            positive_weight=0.0,
+            negative_weight=0.0,
+            ranking_weight=1.0,
+            identity_regularization_weight=0.0,
+        )
+        pair_set = self._current_score_ranking_pair_set()
+
+        loss = v2_separation_loss(model, pair_set, ranking_only)
+
+        self.assertEqual(
+            loss.hard_negative_indices.tolist(),
+            [6, 7, 8, 9, 10, 11, 0, 1, 2, 3],
+        )
+        loss.total.backward()
+        gradient_total = sum(
+            float(parameter.grad.abs().sum())
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        )
+        self.assertGreater(gradient_total, 0.0)
 
     def test_duplicate_sessions_inside_one_group_do_not_increase_group_weight(self) -> None:
         config = V2TrainingConfig(positive_weight=0.0, negative_weight=1.0, ranking_weight=0.0)
@@ -252,6 +290,63 @@ class V2ObjectiveTests(unittest.TestCase):
             negative_weights=np.asarray([0.25, 0.25, 0.5], dtype=np.float32),
             negative_metadata=metadata,
         )
+
+    def _current_score_ranking_pair_set(self) -> V2PairSet:
+        positive_ref = _normalized((1.0, 0.0)).reshape(1, -1)
+        positive_photo = _normalized((0.80, -0.60)).reshape(1, -1)
+        negative_refs = []
+        negative_photos = []
+        metadata: list[PairMetadata] = []
+        for index, cosine in enumerate((0.92, 0.90, 0.88, 0.86, 0.84, 0.82)):
+            negative_refs.append(_normalized((1.0, 0.0)))
+            negative_photos.append(_normalized((cosine, -math.sqrt(1.0 - cosine * cosine))))
+            metadata.append(
+                PairMetadata(
+                    ref_student_id="anchor-student",
+                    ref_session_id="anchor-session",
+                    photo_student_id=f"negative-student-{index:02d}",
+                    photo_session_id=f"negative-session-{index:02d}",
+                    label=0,
+                    raw_cosine=cosine,
+                )
+            )
+        for index, cosine in enumerate((0.80, 0.78, 0.76, 0.74, 0.72, 0.70), start=6):
+            negative_refs.append(_normalized((1.0, 0.0)))
+            negative_photos.append(_normalized((cosine, math.sqrt(1.0 - cosine * cosine))))
+            metadata.append(
+                PairMetadata(
+                    ref_student_id="anchor-student",
+                    ref_session_id="anchor-session",
+                    photo_student_id=f"negative-student-{index:02d}",
+                    photo_session_id=f"negative-session-{index:02d}",
+                    label=0,
+                    raw_cosine=cosine,
+                )
+            )
+        return V2PairSet(
+            positive_ref_embeddings=positive_ref.astype(np.float32, copy=False),
+            positive_photo_embeddings=positive_photo.astype(np.float32, copy=False),
+            positive_student_ids=("anchor-student",),
+            positive_session_ids=("anchor-session",),
+            negative_ref_embeddings=np.stack(negative_refs).astype(np.float32, copy=False),
+            negative_photo_embeddings=np.stack(negative_photos).astype(np.float32, copy=False),
+            negative_group_ids=tuple(f"ranking-group-{index:02d}" for index in range(len(metadata))),
+            negative_categories=("synthetic_cross_student",) * len(metadata),
+            negative_weights=np.full(len(metadata), 1.0 / len(metadata), dtype=np.float32),
+            negative_metadata=tuple(metadata),
+        )
+
+    @staticmethod
+    def _configure_photo_tower_x_from_y(
+        model: LowRankDomainAdapter,
+        *,
+        scale: float,
+    ) -> None:
+        with torch.no_grad():
+            model.photo_tower.down.weight.zero_()
+            model.photo_tower.up.weight.zero_()
+            model.photo_tower.down.weight[0, 1] = 1.0
+            model.photo_tower.up.weight[0, 0] = scale
 
 
 if __name__ == "__main__":

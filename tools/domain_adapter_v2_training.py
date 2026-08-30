@@ -91,29 +91,35 @@ def score_pair_set(
     device: str,
 ) -> V2Scores:
     _validate_model(model)
+    model_device = _model_device(model)
+    requested_device = _requested_device(device)
+    if requested_device != model_device:
+        raise ValueError(
+            f"requested device {requested_device} does not match model device {model_device}"
+        )
     positive_refs = _embedding_tensor(
         pair_set.positive_ref_embeddings,
         dimension=model.dimension,
         description="positive_ref_embeddings",
-        device=device,
+        device=model_device,
     )
     positive_photos = _embedding_tensor(
         pair_set.positive_photo_embeddings,
         dimension=model.dimension,
         description="positive_photo_embeddings",
-        device=device,
+        device=model_device,
     )
     negative_refs = _embedding_tensor(
         pair_set.negative_ref_embeddings,
         dimension=model.dimension,
         description="negative_ref_embeddings",
-        device=device,
+        device=model_device,
     )
     negative_photos = _embedding_tensor(
         pair_set.negative_photo_embeddings,
         dimension=model.dimension,
         description="negative_photo_embeddings",
-        device=device,
+        device=model_device,
     )
     _validate_pair_set_metadata(pair_set, positive_refs.shape[0], negative_refs.shape[0])
 
@@ -257,6 +263,13 @@ def _validate_model(model: LowRankDomainAdapter, expected_rank: int | None = Non
 
 def _model_device(model: LowRankDomainAdapter) -> torch.device:
     return next(model.parameters()).device
+
+
+def _requested_device(device: str) -> torch.device:
+    try:
+        return torch.device(device)
+    except (TypeError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"invalid device {device!r}") from exc
 
 
 def _embedding_tensor(
