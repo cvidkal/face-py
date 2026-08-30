@@ -44,11 +44,17 @@ from tools.evaluate_domain_adapter import (  # noqa: E402
 ENGINEERING_DATASET_FILE_SHA256 = (
     "5add7c1d80e8e79f38ee1b125ad304e8f89bad6bdca146dd25d0e574870c8a3d"
 )
+TRUSTED_BENCHMARK_MANIFEST_FILE_SHA256 = (
+    "3ab56009c957011ce77b2b71178b068b6879d64badc5b9fcf1a8f074ff13699a"
+)
 PRIVATE_FILE_MODE = 0o600
 RELEASE_REGISTRY_SCHEMA_VERSION = 1
 RELEASE_REGISTRY_HASH_SCHEME = "sha256-domain-v1"
 RELEASE_STUDENT_HASH_DOMAIN = b"identity-domain-adapter-release-student\0"
 SAME_THRESHOLD = 0.35
+MIN_RELEASE_UNSEEN_STUDENTS = 50
+MIN_RELEASE_ELIGIBLE_MATCH_SESSIONS = 100
+MIN_RELEASE_ORDERED_CROSS_STUDENT_PAIRS = 2000
 
 
 def _absolute_gate_passes(metrics: dict[str, Any]) -> bool:
@@ -170,6 +176,7 @@ def evaluate_v2_candidate(
         dataset_role=dataset_role,
         cohort_registry=Path(cohort_registry) if cohort_registry is not None else None,
         candidate_training_digest=str(artifact["source_dataset_sha256"]),
+        held_out=held_out,
     )
     engineering_gate_passed = (
         dataset_role == "engineering"
@@ -281,6 +288,12 @@ def _load_v2_artifact(candidate_dir: Path) -> tuple[dict[str, Any], Path]:
 def _load_benchmark_from_manifest(
     benchmark_manifest: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, str | int]]:
+    observed_file_sha = _file_sha256(benchmark_manifest)
+    if observed_file_sha != TRUSTED_BENCHMARK_MANIFEST_FILE_SHA256:
+        raise ValueError(
+            "trusted benchmark manifest file SHA256 mismatch "
+            f"(expected {TRUSTED_BENCHMARK_MANIFEST_FILE_SHA256}, observed {observed_file_sha})"
+        )
     manifest = _load_json_object(benchmark_manifest, "benchmark manifest")
     declared_sha = manifest.get("manifest_sha256")
     if not isinstance(declared_sha, str) or len(declared_sha) != 64:
@@ -402,6 +415,7 @@ def _provenance_report(
     dataset_role: str,
     cohort_registry: Path | None,
     candidate_training_digest: str,
+    held_out: list[Any],
 ) -> dict[str, Any]:
     engineering_dataset_role_absent = "dataset_role" not in dataset
     engineering_manifest_sha256_pinned = (
@@ -420,7 +434,7 @@ def _provenance_report(
         )
         == 0
     )
-    cohort_sufficiency = _cohort_sufficiency(dataset, dataset_role)
+    cohort_sufficiency = _cohort_sufficiency(dataset_role, held_out)
     registry_entry_matches = (
         _registry_entry_matches(dataset, cohort_registry)
         if dataset_role == "release" and cohort_registry is not None
@@ -443,39 +457,61 @@ def _provenance_report(
     }
 
 
-def _cohort_sufficiency(dataset: dict[str, Any], dataset_role: str) -> dict[str, Any]:
+def _cohort_sufficiency(dataset_role: str, held_out: list[Any]) -> dict[str, Any]:
     if dataset_role != "release":
         return {
             "status": "not_applicable",
             "exact_minima": False,
             "summary": None,
         }
-    sufficiency = dataset.get("sufficiency")
-    if not isinstance(sufficiency, dict):
-        return {"status": "missing", "exact_minima": False, "summary": None}
+
+    eligible_sessions = [
+        SessionEmbedding(
+            student_id=item.student_id,
+            session_id=item.session_id,
+            split="test",
+            label="match",
+            ref_embedding=np.asarray(item.ref_embedding, dtype=np.float32),
+            session_prototype=np.asarray(item.session_prototype, dtype=np.float32),
+        )
+        for item in held_out
+        if item.truth == "match"
+        and item.adapter_applied
+        and item.ref_embedding is not None
+        and item.session_prototype is not None
+    ]
+    synthetic_pairs = 0
+    if len({session.student_id for session in eligible_sessions}) >= 2:
+        pair_set = build_v2_pair_set(eligible_sessions)
+        synthetic_pairs = sum(
+            category == "synthetic_cross_student"
+            for category in pair_set.negative_categories
+        )
     summary = {
-        "unseen_students": int(sufficiency.get("unseen_students", 0)),
-        "minimum_unseen_students": int(sufficiency.get("minimum_unseen_students", -1)),
-        "adapter_eligible_truth_match_sessions": int(
-            sufficiency.get("adapter_eligible_truth_match_sessions", 0)
-        ),
-        "minimum_adapter_eligible_truth_match_sessions": int(
-            sufficiency.get("minimum_adapter_eligible_truth_match_sessions", -1)
-        ),
-        "ordered_cross_student_session_pairs": int(
-            sufficiency.get("ordered_cross_student_session_pairs", 0)
-        ),
-        "minimum_ordered_cross_student_session_pairs": int(
-            sufficiency.get("minimum_ordered_cross_student_session_pairs", -1)
-        ),
+        "unseen_students": len({item.student_id for item in held_out}),
+        "minimum_unseen_students": MIN_RELEASE_UNSEEN_STUDENTS,
+        "adapter_eligible_truth_match_sessions": len(eligible_sessions),
+        "minimum_adapter_eligible_truth_match_sessions": MIN_RELEASE_ELIGIBLE_MATCH_SESSIONS,
+        "ordered_cross_student_session_pairs": synthetic_pairs,
+        "minimum_ordered_cross_student_session_pairs": MIN_RELEASE_ORDERED_CROSS_STUDENT_PAIRS,
     }
     exact_minima = (
-        summary["minimum_unseen_students"] == 50
-        and summary["minimum_adapter_eligible_truth_match_sessions"] == 100
-        and summary["minimum_ordered_cross_student_session_pairs"] == 2000
+        summary["minimum_unseen_students"] == MIN_RELEASE_UNSEEN_STUDENTS
+        and summary["minimum_adapter_eligible_truth_match_sessions"]
+        == MIN_RELEASE_ELIGIBLE_MATCH_SESSIONS
+        and summary["minimum_ordered_cross_student_session_pairs"]
+        == MIN_RELEASE_ORDERED_CROSS_STUDENT_PAIRS
     )
     return {
-        "status": str(sufficiency.get("status", "missing")),
+        "status": (
+            "sufficient"
+            if summary["unseen_students"] >= MIN_RELEASE_UNSEEN_STUDENTS
+            and summary["adapter_eligible_truth_match_sessions"]
+            >= MIN_RELEASE_ELIGIBLE_MATCH_SESSIONS
+            and summary["ordered_cross_student_session_pairs"]
+            >= MIN_RELEASE_ORDERED_CROSS_STUDENT_PAIRS
+            else "insufficient_data"
+        ),
         "exact_minima": exact_minima,
         "summary": summary,
     }
