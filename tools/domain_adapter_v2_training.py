@@ -31,6 +31,7 @@ from tools.domain_adapter_v2_metrics import (
     bootstrap_far_upper_bound,
     build_v2_pair_set,
     calibrate_threshold,
+    student_balanced_match_recall,
 )
 
 _FOLD_COUNT = 5
@@ -248,6 +249,8 @@ def train_v2_candidate(
     trace: TrainingTrace | None = None,
 ) -> V2TrainingResult:
     canonical_manifest = _canonical_training_manifest(manifest)
+    train_only_manifest = _train_only_manifest(canonical_manifest)
+    selection_digest = _canonical_dataset_digest(train_only_manifest)
     dataset_digest = _canonical_dataset_digest(canonical_manifest)
     sessions = tuple(
         extract_session_embeddings(
@@ -266,7 +269,7 @@ def train_v2_candidate(
 
     validation_pair_set = build_v2_pair_set(validation_sessions)
     _validate_partition_size("canonical validation", validation_sessions)
-    if len(set(validation_pair_set.negative_group_ids)) < _MIN_VALIDATION_GROUPS:
+    if _synthetic_group_count(validation_pair_set) < _MIN_VALIDATION_GROUPS:
         raise InsufficientDataError(
             "canonical validation must contain at least 1000 ordered groups"
         )
@@ -298,12 +301,11 @@ def train_v2_candidate(
             epoch_loss = train_fold_epoch(model, optimizer, train_pair_set, config)
             validation_loss = _score_validation_loss(model, held_out_pair_set, config)
             scores = score_pair_set(model, held_out_pair_set, device)
-            threshold = calibrate_threshold(
+            threshold = _select_empirical_threshold(
                 positive_scores=scores.positive,
                 positive_student_ids=held_out_pair_set.positive_student_ids,
                 negative_scores=scores.negative,
                 negative_group_ids=held_out_pair_set.negative_group_ids,
-                dataset_digest=dataset_digest,
             )
             fold_history.append(
                 FoldEpochMetrics(
@@ -321,7 +323,7 @@ def train_v2_candidate(
                 )
             )
 
-    selection = select_v2_epoch(fold_history, dataset_digest)
+    selection = select_v2_epoch(fold_history, selection_digest)
     full_training_pair_set = build_v2_pair_set(train_sessions)
     final_model = _fresh_model(dimension=dimension, rank=config.rank, seed=seed, device=device)
     final_optimizer = torch.optim.Adam(
@@ -541,6 +543,20 @@ def _canonical_training_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _train_only_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "snapshot": manifest.get("snapshot", ""),
+        "split_seed": manifest.get("split_seed", ""),
+        "sessions": [
+            dict(row)
+            for row in manifest.get("sessions", [])
+            if row.get("split") == "train"
+        ],
+        "evaluation_sessions": [],
+    }
+
+
 def _canonical_dataset_digest(manifest: dict[str, Any]) -> str:
     payload = json.dumps(
         manifest,
@@ -574,6 +590,84 @@ def _embedding_dimension(sessions: Sequence[SessionEmbedding]) -> int:
     if not sessions:
         raise InsufficientDataError("canonical data produced no train or validation sessions")
     return int(np.asarray(sessions[0].ref_embedding).reshape(-1).size)
+
+
+def _synthetic_group_count(pair_set: V2PairSet) -> int:
+    return len(
+        {
+            group_id
+            for group_id, category in zip(
+                pair_set.negative_group_ids,
+                pair_set.negative_categories,
+                strict=True,
+            )
+            if category == "synthetic_cross_student"
+        }
+    )
+
+
+def _select_empirical_threshold(
+    *,
+    positive_scores: np.ndarray,
+    positive_student_ids: Sequence[str],
+    negative_scores: np.ndarray,
+    negative_group_ids: Sequence[str],
+    threshold_floor: float = _MIN_THRESHOLD,
+    max_empirical_far: float = _MAX_FOLD_EMPIRICAL_FAR,
+) -> CalibratedThreshold:
+    positives = np.asarray(positive_scores, dtype=np.float64).reshape(-1)
+    negatives = np.asarray(negative_scores, dtype=np.float64).reshape(-1)
+    if positives.size != len(positive_student_ids):
+        raise ValueError("positive_scores and positive_student_ids must have the same length")
+    if negatives.size != len(negative_group_ids):
+        raise ValueError("negative_scores and negative_group_ids must have the same length")
+    if positives.size == 0 or negatives.size == 0:
+        raise ValueError("positive_scores and negative_scores must not be empty")
+
+    best: CalibratedThreshold | None = None
+    for threshold in np.round(np.arange(threshold_floor, 1.001, 0.001), 3):
+        empirical_far = float(np.mean(negatives >= threshold))
+        recall = student_balanced_match_recall(positives, positive_student_ids, threshold)
+        candidate = CalibratedThreshold(
+            threshold=float(threshold),
+            empirical_far=empirical_far,
+            far_upper_95=empirical_far,
+            student_balanced_recall=recall,
+            true_matches=int(np.count_nonzero(positives >= threshold)),
+            feasible=empirical_far <= max_empirical_far,
+        )
+        if not candidate.feasible:
+            continue
+        if best is None:
+            best = candidate
+            continue
+        key = (
+            candidate.student_balanced_recall,
+            -candidate.empirical_far,
+            candidate.threshold,
+        )
+        best_key = (
+            best.student_balanced_recall,
+            -best.empirical_far,
+            best.threshold,
+        )
+        if key > best_key:
+            best = candidate
+
+    if best is not None:
+        return best
+    return CalibratedThreshold(
+        threshold=threshold_floor,
+        empirical_far=float(np.mean(negatives >= threshold_floor)),
+        far_upper_95=float(np.mean(negatives >= threshold_floor)),
+        student_balanced_recall=student_balanced_match_recall(
+            positives,
+            positive_student_ids,
+            threshold_floor,
+        ),
+        true_matches=int(np.count_nonzero(positives >= threshold_floor)),
+        feasible=False,
+    )
 
 
 def _fresh_model(
