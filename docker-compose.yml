@@ -25,9 +25,14 @@ services:
     restart: on-failure:3
     env_file:
       - deploy/env/dev.env
+    environment:
+      FACE_DOMAIN_ADAPTER_MODE: ${FACE_DOMAIN_ADAPTER_MODE:-off}
+      FACE_DOMAIN_ADAPTER_PATH: ${FACE_DOMAIN_ADAPTER_PATH:-/models/identity-domain-adapter/identity_domain_adapter.onnx}
     volumes:
       # 模型文件 — 不打镜像 (大且 gitignored)
       - ./models:/app/models:ro
+      # Optional adapter artifact — host data only, never baked into the image.
+      - ${FACE_DOMAIN_ADAPTER_HOST_DIR:-./models/identity-domain-adapter}:/models/identity-domain-adapter:ro
       # 客户图像数据 — 跟 face C++ 容器同款挂载点, TA 发的绝对路径在容器内可读
       - /var/lib/training_analyzer/sessions:/var/lib/training_analyzer/sessions:ro
 
@@ -42,6 +47,10 @@ services:
     restart: unless-stopped
     env_file:
       - deploy/env/prod.env
+    environment:
+      FACE_DOMAIN_ADAPTER_MODE: ${FACE_DOMAIN_ADAPTER_MODE:-off}
+      FACE_DOMAIN_ADAPTER_PATH: ${FACE_DOMAIN_ADAPTER_PATH:-/models/identity-domain-adapter/identity_domain_adapter.onnx}
     volumes:
       - ./models:/app/models:ro
+      - ${FACE_DOMAIN_ADAPTER_HOST_DIR:-./models/identity-domain-adapter}:/models/identity-domain-adapter:ro
       - /var/lib/training_analyzer/sessions:/var/lib/training_analyzer/sessions:ro

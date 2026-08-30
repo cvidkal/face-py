@@ -145,38 +145,52 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/api/v1/health":
-            self._handle_health(); return
+            self._handle_health()
+            return
         self._error(HTTPStatus.NOT_FOUND, f"unknown path: {self.path}")
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/api/v1/face/identity_check":
-            self._handle_identity_check(); return
+            self._handle_identity_check()
+            return
         if self.path == "/api/v1/face/compare":
-            self._handle_compare(); return
+            self._handle_compare()
+            return
         if self.path == "/api/v1/face/session_check":
-            self._handle_session_check(); return
+            self._handle_session_check()
+            return
         self._error(HTTPStatus.NOT_FOUND, f"unknown path: {self.path}")
 
     # ----- handlers -----
 
     def _handle_health(self) -> None:
         uptime = time.time() - self.started_at
+        adapter = self.pipeline.domain_adapter
         self._write_json(HTTPStatus.OK, {
             "status": "ok",
             "version": _read_version(),
             "uptime_seconds": round(uptime, 3),
             "auth_required": self.auth_required,
+            "domain_adapter": {
+                "mode": adapter.mode,
+                "ready": adapter.ready,
+                "version": adapter.version,
+                "sha256": adapter.artifact_sha256,
+                "load_error": adapter.load_error,
+            },
         })
 
     def _handle_identity_check(self) -> None:
         request_id = ""
         if not self._check_auth():
             self._error(HTTPStatus.UNAUTHORIZED, "missing authentication token",
-                        error_code="unauthorized"); return
+                        error_code="unauthorized")
+            return
         try:
             body = self._read_json_body()
         except ValueError as exc:
-            self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request"); return
+            self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request")
+            return
         request_id = str(body.get("request_id", "") or uuid.uuid4())
 
         image_path = str(body.get("image_path", ""))
@@ -184,11 +198,13 @@ class Handler(BaseHTTPRequestHandler):
         if not image_path:
             self._error(HTTPStatus.BAD_REQUEST,
                          "Field 'image_path' required (non-empty string)",
-                         request_id, "invalid_request"); return
+                         request_id, "invalid_request")
+            return
         if not ref_image_path:
             self._error(HTTPStatus.BAD_REQUEST,
                          "Field 'ref_image_path' required (non-empty string)",
-                         request_id, "invalid_request"); return
+                         request_id, "invalid_request")
+            return
 
         # face C++ identity_check 返 200 + error_code 字段 (业务级失败不抛 HTTP 5xx).
         result = self.pipeline.identity_check(image_path, ref_image_path)
@@ -198,11 +214,13 @@ class Handler(BaseHTTPRequestHandler):
         request_id = ""
         if not self._check_auth():
             self._error(HTTPStatus.UNAUTHORIZED, "missing authentication token",
-                        error_code="unauthorized"); return
+                        error_code="unauthorized")
+            return
         try:
             body = self._read_json_body()
         except ValueError as exc:
-            self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request"); return
+            self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request")
+            return
         request_id = str(body.get("request_id", "") or uuid.uuid4())
 
         image_a = str(body.get("image_a_path", ""))
@@ -210,7 +228,8 @@ class Handler(BaseHTTPRequestHandler):
         if not image_a or not image_b:
             self._error(HTTPStatus.BAD_REQUEST,
                          "Fields 'image_a_path' and 'image_b_path' required",
-                         request_id, "invalid_request"); return
+                         request_id, "invalid_request")
+            return
 
         result = self.pipeline.compare(image_a, image_b)
         self._write_json(HTTPStatus.OK, result.to_json())
@@ -227,11 +246,13 @@ class Handler(BaseHTTPRequestHandler):
         request_id = ""
         if not self._check_auth():
             self._error(HTTPStatus.UNAUTHORIZED, "missing authentication token",
-                        error_code="unauthorized"); return
+                        error_code="unauthorized")
+            return
         try:
             body = self._read_json_body()
         except ValueError as exc:
-            self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request"); return
+            self._error(HTTPStatus.BAD_REQUEST, str(exc), request_id, "invalid_request")
+            return
         request_id = str(body.get("request_id", "") or uuid.uuid4())
 
         ref_image_path = str(body.get("ref_image_path", ""))
@@ -239,11 +260,13 @@ class Handler(BaseHTTPRequestHandler):
         if not ref_image_path:
             self._error(HTTPStatus.BAD_REQUEST,
                          "Field 'ref_image_path' required (non-empty string)",
-                         request_id, "invalid_request"); return
+                         request_id, "invalid_request")
+            return
         if not isinstance(photos, list) or not photos:
             self._error(HTTPStatus.BAD_REQUEST,
                          "Field 'photos' required (non-empty array)",
-                         request_id, "invalid_request"); return
+                         request_id, "invalid_request")
+            return
 
         result = self.pipeline.session_check(ref_image_path, photos)
         self._write_json(HTTPStatus.OK, result.to_json())
@@ -286,6 +309,17 @@ def main() -> int:
     log.info(json.dumps({
         "event": "pipeline_ready",
         "providers": Handler.pipeline.recognizer.providers,
+    }))
+    adapter = Handler.pipeline.domain_adapter
+    log.info(json.dumps({
+        "event": "domain_adapter_ready"
+        if adapter.ready or adapter.mode == "off"
+        else "domain_adapter_fallback",
+        "mode": adapter.mode,
+        "ready": adapter.ready,
+        "version": adapter.version,
+        "sha256": adapter.artifact_sha256,
+        "load_error": adapter.load_error,
     }))
 
     log.info(json.dumps({
