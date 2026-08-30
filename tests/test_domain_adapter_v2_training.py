@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import io
+import json
 import math
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import onnxruntime as ort
 import torch
 
 from tools.domain_adapter_training import (
@@ -29,12 +33,14 @@ from tools.domain_adapter_v2_training import (
     V2EpochLoss,
     V2Selection,
     V2TrainingConfig,
+    write_v2_candidate_artifacts,
     score_pair_set,
     select_v2_epoch,
     train_fold_epoch,
     train_v2_candidate,
     v2_separation_loss,
 )
+from tools.train_domain_adapter_v2 import main as train_main
 
 
 class V2TrainingConfigTests(unittest.TestCase):
@@ -1068,6 +1074,329 @@ class V2CandidateTrainingTests(unittest.TestCase):
             true_matches=len(positive_scores),
             feasible=True,
         )
+
+
+class V2ArtifactAndCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.output_dir = self.root / "candidate-v2"
+        self.embedding_cache = self.root / "embedding-cache"
+        self.embedding_cache.mkdir()
+        self.manifest_path = self.root / "dataset.json"
+        self.manifest_path.write_text(
+            json.dumps({"schema_version": 1, "sessions": [], "evaluation_sessions": []}),
+            encoding="utf-8",
+        )
+        self.result = self._result()
+
+    def test_write_v2_candidate_artifacts_exports_public_manifest_and_dynamic_batch_onnx(
+        self,
+    ) -> None:
+        manifest = write_v2_candidate_artifacts(
+            self.output_dir,
+            self.result,
+            seed=20260830,
+        )
+
+        self.assertEqual(
+            sorted(path.name for path in self.output_dir.iterdir()),
+            [
+                "identity_domain_adapter.manifest.json",
+                "identity_domain_adapter.onnx",
+            ],
+        )
+        self.assertEqual(self.output_dir.stat().st_mode & 0o777, 0o700)
+        for path in self.output_dir.iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+        onnx_path = self.output_dir / "identity_domain_adapter.onnx"
+        session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        batch_one_refs = self._normalized_rows(1, self.result.model.dimension)
+        batch_one_photos = self._normalized_rows(
+            1,
+            self.result.model.dimension,
+            offset=100,
+        )
+        batch_seven_refs = self._normalized_rows(
+            7,
+            self.result.model.dimension,
+            offset=200,
+        )
+        batch_seven_photos = self._normalized_rows(
+            7,
+            self.result.model.dimension,
+            offset=300,
+        )
+        for refs, photos in (
+            (batch_one_refs, batch_one_photos),
+            (batch_seven_refs, batch_seven_photos),
+        ):
+            actual = session.run(
+                ["adapted_cosine"],
+                {"ref_embedding": refs, "photo_embedding": photos},
+            )[0]
+            expected = (
+                self.result.model(
+                    torch.from_numpy(refs),
+                    torch.from_numpy(photos),
+                )
+                .detach()
+                .numpy()
+            )
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-5)
+        self.assertEqual(session.get_inputs()[0].shape, ["N", self.result.model.dimension])
+        self.assertEqual(session.get_outputs()[0].shape, ["N"])
+        self.assertEqual(
+            json.loads(
+                (self.output_dir / "identity_domain_adapter.manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            manifest,
+        )
+        self.assertEqual(manifest["model_version"], "identity-domain-adapter-v2")
+        self.assertLessEqual(manifest["onnx_parity_max_abs_error"], 1e-5)
+        self.assertEqual(manifest["training"]["selected_epoch"], self.result.selection.epoch)
+
+    def test_public_artifact_excludes_private_training_material(self) -> None:
+        manifest = write_v2_candidate_artifacts(
+            self.output_dir,
+            self.result,
+            seed=20260830,
+        )
+
+        encoded = json.dumps(manifest, sort_keys=True)
+        for forbidden in (
+            "student_id",
+            "session_id",
+            "image_path",
+            "session_prototype",
+            "group-secret",
+            "student-secret",
+            "/private/input",
+        ):
+            self.assertNotIn(forbidden, encoded)
+        self.assertEqual(
+            manifest["training"]["negative_categories"]["counts"],
+            {
+                "human_mismatch": 25,
+                "synthetic_cross_student": 1000,
+            },
+        )
+        self.assertEqual(
+            manifest["training"]["negative_categories"]["weights"],
+            {
+                "human_mismatch": 0.2,
+                "synthetic_cross_student": 0.8,
+            },
+        )
+
+    def test_write_v2_candidate_artifacts_refuses_existing_output_path(self) -> None:
+        self.output_dir.mkdir()
+
+        with self.assertRaisesRegex(FileExistsError, "already exists"):
+            write_v2_candidate_artifacts(
+                self.output_dir,
+                self.result,
+                seed=20260830,
+            )
+
+    def test_write_v2_candidate_artifacts_preserves_non_loadable_failure_evidence(
+        self,
+    ) -> None:
+        with patch(
+            "tools.domain_adapter_v2_training.export_onnx",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                write_v2_candidate_artifacts(
+                    self.output_dir,
+                    self.result,
+                    seed=20260830,
+                )
+
+        self.assertFalse(self.output_dir.exists())
+        evidence_dirs = [path for path in self.root.iterdir() if path.is_dir()]
+        self.assertEqual(len(evidence_dirs), 2)
+        failure_dirs = [path for path in evidence_dirs if path != self.embedding_cache]
+        self.assertEqual(len(failure_dirs), 1)
+        self.assertFalse(
+            (failure_dirs[0] / "identity_domain_adapter.manifest.json").exists()
+        )
+
+    def test_cli_refuses_existing_output_directory(self) -> None:
+        self.output_dir.mkdir()
+
+        with self.assertRaisesRegex(FileExistsError, "already exists"):
+            train_main(
+                [
+                    "--manifest",
+                    str(self.manifest_path),
+                    "--embedding-cache",
+                    str(self.embedding_cache),
+                    "--output-dir",
+                    str(self.output_dir),
+                ]
+            )
+
+    def test_cli_rejects_tuning_overrides(self) -> None:
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                train_main(
+                    [
+                        "--manifest",
+                        str(self.manifest_path),
+                        "--embedding-cache",
+                        str(self.embedding_cache),
+                        "--output-dir",
+                        str(self.output_dir),
+                        "--epochs",
+                        "12",
+                    ]
+                )
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_cli_uses_fixed_v2_training_contract(self) -> None:
+        stdout = io.StringIO()
+        artifact = {"schema_version": 1, "model_version": "identity-domain-adapter-v2"}
+
+        with patch(
+            "tools.train_domain_adapter_v2.train_v2_candidate",
+            return_value=self.result,
+        ) as train_candidate:
+            with patch(
+                "tools.train_domain_adapter_v2.write_v2_candidate_artifacts",
+                return_value=artifact,
+            ) as write_artifacts:
+                with redirect_stdout(stdout):
+                    exit_code = train_main(
+                        [
+                            "--manifest",
+                            str(self.manifest_path),
+                            "--embedding-cache",
+                            str(self.embedding_cache),
+                            "--output-dir",
+                            str(self.output_dir),
+                            "--seed",
+                            "20260901",
+                            "--device",
+                            "cpu",
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 0)
+        train_candidate.assert_called_once()
+        self.assertEqual(train_candidate.call_args.args[1], self.embedding_cache)
+        self.assertIsInstance(train_candidate.call_args.args[2], V2TrainingConfig)
+        self.assertEqual(train_candidate.call_args.kwargs["seed"], 20260901)
+        self.assertEqual(train_candidate.call_args.kwargs["device"], "cpu")
+        write_artifacts.assert_called_once_with(
+            self.output_dir,
+            self.result,
+            seed=20260901,
+        )
+        self.assertEqual(json.loads(stdout.getvalue()), artifact)
+
+    @staticmethod
+    def _normalized_rows(
+        count: int,
+        dimension: int,
+        *,
+        offset: int = 0,
+    ) -> np.ndarray:
+        rows = np.zeros((count, dimension), dtype=np.float32)
+        for index in range(count):
+            rows[index, (offset + index) % dimension] = 1.0
+            rows[index, (offset + index + 1) % dimension] = 0.25
+        rows /= np.linalg.norm(rows, axis=1, keepdims=True)
+        return rows.astype(np.float32, copy=False)
+
+    def _result(self):
+        torch.manual_seed(9)
+        model = LowRankDomainAdapter(dimension=128, rank=16)
+        with torch.no_grad():
+            model.ref_tower.up.weight.normal_(std=0.01)
+            model.photo_tower.up.weight.normal_(std=0.01)
+        return type(
+            "Result",
+            (),
+            {
+                "model": model,
+                "selection": V2Selection(
+                    epoch=4,
+                    median_recall=0.72,
+                    worst_fold_recall=0.70,
+                    pooled_far_upper_95=0.009,
+                    residual_drift=0.02,
+                    validation_loss=0.05,
+                ),
+                "fold_history": tuple(
+                    FoldEpochMetrics(
+                        fold=fold,
+                        epoch=4,
+                        candidate_threshold=0.35 + fold * 0.001,
+                        empirical_far=0.001 * fold,
+                        student_balanced_recall=0.70 + fold * 0.01,
+                        validation_loss=0.05 + fold * 0.001,
+                        residual_drift=0.02 + fold * 0.001,
+                        negative_group_ids=(f"group-secret-{fold}",),
+                        negative_accepts=(False,),
+                        student_count=20,
+                        session_count=20,
+                        match_session_count=20,
+                        negative_group_count=200 + fold,
+                    )
+                    for fold in range(5)
+                ),
+                "adapted_threshold": CalibratedThreshold(
+                    threshold=0.41,
+                    empirical_far=0.001,
+                    far_upper_95=0.009,
+                    student_balanced_recall=0.78,
+                    true_matches=33,
+                    feasible=True,
+                ),
+                "raw_threshold": CalibratedThreshold(
+                    threshold=0.44,
+                    empirical_far=0.003,
+                    far_upper_95=0.01,
+                    student_balanced_recall=0.71,
+                    true_matches=30,
+                    feasible=True,
+                ),
+                "dataset_digest": "a" * 64,
+                "source_feedback_snapshot": "2026-08-30T12:00:00+00:00",
+                "split_seed": "seed-v2",
+                "split_counts": {
+                    "train": {
+                        "sessions": 100,
+                        "positive_sessions": 100,
+                        "negative_sessions": 0,
+                    },
+                    "validation": {
+                        "sessions": 33,
+                        "positive_sessions": 33,
+                        "negative_sessions": 0,
+                    },
+                    "test": {
+                        "sessions": 0,
+                        "positive_sessions": 0,
+                        "negative_sessions": 0,
+                    },
+                },
+                "validation_negative_category_counts": {
+                    "human_mismatch": 25,
+                    "synthetic_cross_student": 1000,
+                },
+                "validation_negative_category_weight_totals": {
+                    "human_mismatch": 0.2,
+                    "synthetic_cross_student": 0.8,
+                },
+            },
+        )()
 
 
 if __name__ == "__main__":

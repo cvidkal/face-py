@@ -5,12 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import subprocess
+import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import onnxruntime as ort
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -19,6 +23,8 @@ from tools.domain_adapter_training import (
     LowRankDomainAdapter,
     PairMetadata,
     SessionEmbedding,
+    _atomic_write_private_json,
+    export_onnx,
     extract_session_embeddings,
     manifest_training_rows,
     residual_weight_regularization,
@@ -28,6 +34,7 @@ from tools.domain_adapter_v2_metrics import (
     CalibratedThreshold,
     V2PairSet,
     assign_training_folds,
+    bootstrap_seed,
     bootstrap_far_upper_bound,
     build_v2_pair_set,
     calibrate_threshold,
@@ -120,6 +127,10 @@ class FoldEpochMetrics:
     residual_drift: float
     negative_group_ids: tuple[str, ...] = field(repr=False)
     negative_accepts: tuple[bool, ...] = field(repr=False)
+    student_count: int = 0
+    session_count: int = 0
+    match_session_count: int = 0
+    negative_group_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -148,6 +159,11 @@ class V2TrainingResult:
     adapted_threshold: CalibratedThreshold
     raw_threshold: CalibratedThreshold
     dataset_digest: str
+    source_feedback_snapshot: str
+    split_seed: str
+    split_counts: dict[str, dict[str, int]]
+    validation_negative_category_counts: dict[str, int]
+    validation_negative_category_weight_totals: dict[str, float]
 
 
 class InsufficientDataError(ValueError):
@@ -320,6 +336,14 @@ def train_v2_candidate(
                     negative_accepts=tuple(
                         bool(score >= threshold.threshold) for score in scores.negative
                     ),
+                    student_count=len(
+                        {session.student_id for session in held_out_sessions}
+                    ),
+                    session_count=len(held_out_sessions),
+                    match_session_count=sum(
+                        1 for session in held_out_sessions if session.label == "match"
+                    ),
+                    negative_group_count=len(set(held_out_pair_set.negative_group_ids)),
                 )
             )
 
@@ -359,7 +383,283 @@ def train_v2_candidate(
         adapted_threshold=adapted_threshold,
         raw_threshold=raw_threshold,
         dataset_digest=dataset_digest,
+        source_feedback_snapshot=str(canonical_manifest.get("snapshot", "")),
+        split_seed=str(canonical_manifest.get("split_seed", "")),
+        split_counts=_split_counts(
+            canonical_manifest,
+            train_pairs=full_training_pair_set,
+            validation_pairs=validation_pair_set,
+        ),
+        validation_negative_category_counts=validation_pair_set.negative_category_counts,
+        validation_negative_category_weight_totals=(
+            validation_pair_set.negative_category_weight_totals
+        ),
     )
+
+
+def write_v2_candidate_artifacts(
+    output_dir: Path,
+    result: V2TrainingResult,
+    seed: int,
+) -> dict[str, Any]:
+    output_dir = Path(output_dir)
+    if output_dir.exists():
+        raise FileExistsError(f"output directory already exists: {output_dir}")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    temporary_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent)
+    )
+    os.chmod(temporary_dir, 0o700)
+    try:
+        onnx_path = temporary_dir / "identity_domain_adapter.onnx"
+        parity_error = _export_v2_onnx_with_dynamic_batch_parity(result.model, onnx_path)
+        manifest = _v2_runtime_manifest(
+            result=result,
+            seed=seed,
+            onnx_file=onnx_path.name,
+            onnx_sha256=hashlib.sha256(onnx_path.read_bytes()).hexdigest(),
+            onnx_parity_max_abs_error=parity_error,
+        )
+        _atomic_write_private_json(
+            temporary_dir / "identity_domain_adapter.manifest.json",
+            manifest,
+        )
+        os.replace(temporary_dir, output_dir)
+        os.chmod(output_dir, 0o700)
+        for path in output_dir.iterdir():
+            os.chmod(path, 0o600)
+        return manifest
+    except Exception as exc:
+        _preserve_failure_evidence(temporary_dir, exc)
+        raise
+
+
+def _export_v2_onnx_with_dynamic_batch_parity(
+    model: LowRankDomainAdapter,
+    output_path: Path,
+    *,
+    absolute_tolerance: float = 1e-5,
+) -> float:
+    parity_batches = _parity_batches(model.dimension)
+    original_device = _model_device(model)
+    moved = _canonical_device_key(original_device) != ("cpu", None)
+    if moved:
+        model.to(device="cpu")
+    try:
+        max_error = export_onnx(
+            model,
+            output_path,
+            parity_inputs=parity_batches[1],
+            absolute_tolerance=absolute_tolerance,
+        )
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        session = ort.InferenceSession(
+            str(output_path),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        for refs, photos in parity_batches.values():
+            actual = session.run(
+                ["adapted_cosine"],
+                {"ref_embedding": refs, "photo_embedding": photos},
+            )[0]
+            with torch.no_grad():
+                expected = model(
+                    torch.from_numpy(refs),
+                    torch.from_numpy(photos),
+                ).detach().cpu().numpy()
+            batch_error = float(np.max(np.abs(actual - expected)))
+            if not np.isfinite(actual).all() or batch_error > absolute_tolerance:
+                raise RuntimeError(
+                    "ONNX parity failed: "
+                    f"max_abs_error={batch_error:.12g}, "
+                    f"tolerance={absolute_tolerance:.12g}"
+                )
+            max_error = max(max_error, batch_error)
+        return max_error
+    finally:
+        if moved:
+            model.to(device=original_device)
+
+
+def _parity_batches(dimension: int) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    generator = torch.Generator().manual_seed(0)
+    batches: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for batch_size in (1, 7):
+        refs = F.normalize(torch.randn(batch_size, dimension, generator=generator), dim=1)
+        photos = F.normalize(
+            torch.randn(batch_size, dimension, generator=generator),
+            dim=1,
+        )
+        batches[batch_size] = (
+            refs.numpy().astype(np.float32, copy=False),
+            photos.numpy().astype(np.float32, copy=False),
+        )
+    return batches
+
+
+def _v2_runtime_manifest(
+    *,
+    result: V2TrainingResult,
+    seed: int,
+    onnx_file: str,
+    onnx_sha256: str,
+    onnx_parity_max_abs_error: float,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "model_version": "identity-domain-adapter-v2",
+        "embedding_dimension": result.model.dimension,
+        "rank": result.model.rank,
+        "match_threshold": result.adapted_threshold.threshold,
+        "onnx_file": onnx_file,
+        "onnx_sha256": onnx_sha256,
+        "onnx_parity_max_abs_error": onnx_parity_max_abs_error,
+        "source_feedback_snapshot": result.source_feedback_snapshot,
+        "source_dataset_sha256": result.dataset_digest,
+        "source_code_revision": _source_revision(),
+        "split_seed": result.split_seed,
+        "split_counts": result.split_counts,
+        "training_hyperparameters": {"seed": seed},
+        "validation_metrics": asdict(result.adapted_threshold),
+        "test_metrics": None,
+        "input_names": ["ref_embedding", "photo_embedding"],
+        "output_name": "adapted_cosine",
+        "training": {
+            "strategy": "five_fold_student_oof_v2",
+            "fold_schema_version": 1,
+            "fold_seed": "identity-domain-adapter-v2-folds",
+            "fold_count": _FOLD_COUNT,
+            "fold_counts": _public_fold_summaries(
+                result.fold_history,
+                selected_epoch=result.selection.epoch,
+            ),
+            "selected_epoch": result.selection.epoch,
+            "selection_key": [
+                "median_recall",
+                "worst_fold_recall",
+                "residual_drift",
+                "validation_loss",
+                "earliest_epoch",
+            ],
+            "loss": asdict(V2TrainingConfig()),
+            "negative_construction": "exhaustive_cross_student_ordered_pairs",
+            "negative_weighting": "equal_total_weight_per_ordered_student_pair",
+            "negative_categories": {
+                "counts": dict(sorted(result.validation_negative_category_counts.items())),
+                "weights": {
+                    key: value
+                    for key, value in sorted(
+                        result.validation_negative_category_weight_totals.items()
+                    )
+                },
+            },
+            "bootstrap": {
+                "iterations": 10000,
+                "seed": bootstrap_seed(result.dataset_digest),
+                "quantile_method": "higher",
+            },
+            "threshold_floor": _MIN_THRESHOLD,
+            "adapted_threshold": asdict(result.adapted_threshold),
+            "raw_comparator_threshold": asdict(result.raw_threshold),
+            "canonical_dataset_digest": result.dataset_digest,
+        },
+    }
+
+
+def _public_fold_summaries(
+    history: Sequence[FoldEpochMetrics],
+    *,
+    selected_epoch: int,
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for metric in sorted(
+        (item for item in history if item.epoch == selected_epoch),
+        key=lambda item: item.fold,
+    ):
+        summaries.append(
+            {
+                "fold": metric.fold,
+                "students": metric.student_count,
+                "sessions": metric.session_count,
+                "match_sessions": metric.match_session_count,
+                "negative_groups": metric.negative_group_count,
+                "empirical_far": metric.empirical_far,
+                "student_balanced_recall": metric.student_balanced_recall,
+                "residual_drift": metric.residual_drift,
+                "validation_loss": metric.validation_loss,
+            }
+        )
+    return summaries
+
+
+def _split_counts(
+    manifest: dict[str, Any],
+    *,
+    train_pairs: V2PairSet,
+    validation_pairs: V2PairSet,
+) -> dict[str, dict[str, int]]:
+    counts = {
+        split: {
+            "sessions": 0,
+            "positive_sessions": 0,
+            "negative_sessions": 0,
+            "pairs": 0,
+            "positive_pairs": 0,
+            "negative_pairs": 0,
+        }
+        for split in ("train", "validation", "test")
+    }
+    for row in manifest.get("sessions", []):
+        split = str(row["split"])
+        split_counts = counts[split]
+        split_counts["sessions"] += 1
+        key = "positive_sessions" if row["label"] == "match" else "negative_sessions"
+        split_counts[key] += 1
+    counts["train"]["positive_pairs"] = len(train_pairs.positive_student_ids)
+    counts["train"]["negative_pairs"] = len(train_pairs.negative_metadata)
+    counts["train"]["pairs"] = (
+        counts["train"]["positive_pairs"] + counts["train"]["negative_pairs"]
+    )
+    counts["validation"]["positive_pairs"] = len(validation_pairs.positive_student_ids)
+    counts["validation"]["negative_pairs"] = len(validation_pairs.negative_metadata)
+    counts["validation"]["pairs"] = (
+        counts["validation"]["positive_pairs"] + counts["validation"]["negative_pairs"]
+    )
+    return counts
+
+
+def _preserve_failure_evidence(path: Path, exc: Exception) -> None:
+    if not path.exists():
+        return
+    try:
+        for child in path.iterdir():
+            if child.is_file():
+                os.chmod(child, 0o600)
+        os.chmod(path, 0o700)
+        _atomic_write_private_json(
+            path / "artifact-export-failure.json",
+            {
+                "schema_version": 1,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            },
+        )
+    except Exception:
+        pass
+
+
+def _source_revision() -> str:
+    repo_root = Path(__file__).resolve().parent.parent
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
 
 
 def score_pair_set(
