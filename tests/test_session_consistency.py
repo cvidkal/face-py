@@ -7,10 +7,17 @@ model.
 """
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
+from module.face.pipeline import (
+    FacePipeline,
+    RefFeatureCache,
+    SessionPhotoResult,
+)
 from module.face.session_consistency import (
     check_internal_consistency, session_prototype,
 )
@@ -31,6 +38,50 @@ def _near(base: np.ndarray, rng: np.random.Generator, noise: float = 0.05) -> np
     perturb = rng.standard_normal(base.shape).astype(np.float32) * noise
     v = base + perturb
     return v / np.linalg.norm(v)
+
+
+class _AdapterSpy:
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.ready = True
+        self.version = "test-v1"
+        self.artifact_sha256 = "a" * 64
+        self.calls = 0
+
+    def compare(self, _ref: np.ndarray, _photo: np.ndarray) -> None:
+        self.calls += 1
+        raise AssertionError("Stage 1 must bypass the domain adapter")
+
+
+class _SyntheticSessionPipeline(FacePipeline):
+    def __init__(
+        self,
+        ref_path: str,
+        ref_embedding: np.ndarray,
+        photo_embeddings: list[np.ndarray],
+        adapter: _AdapterSpy,
+    ) -> None:
+        ref_cache = RefFeatureCache()
+        cache_key = RefFeatureCache.make_key(ref_path)
+        assert cache_key is not None
+        ref_cache.put(cache_key, ref_embedding)
+        super().__init__(
+            detector=None,  # type: ignore[arg-type]
+            aligner=None,  # type: ignore[arg-type]
+            recognizer=None,  # type: ignore[arg-type]
+            ref_cache=ref_cache,
+        )
+        self.domain_adapter = adapter
+        self._photo_embeddings = photo_embeddings
+
+    def _process_photo_for_session(self, photo: dict) -> SessionPhotoResult:
+        result = SessionPhotoResult(
+            sequence_no=int(photo["sequence_no"]),
+            photo_type="synthetic",
+            passes_gate=True,
+        )
+        result._embedding = self._photo_embeddings[result.sequence_no - 1]  # type: ignore[attr-defined]
+        return result
 
 
 class StageOneTest(unittest.TestCase):
@@ -109,6 +160,38 @@ class SessionPrototypeTest(unittest.TestCase):
     def test_empty_raises(self) -> None:
         with self.assertRaises(ValueError):
             session_prototype([])
+
+
+class PipelineStageOneRegressionTest(unittest.TestCase):
+    def test_known_outlier_is_unchanged_and_bypasses_every_adapter_mode(self) -> None:
+        rng = np.random.default_rng(42)
+        base = _seeded_unit(rng)
+        embeddings = [_near(base, rng, noise=0.05) for _ in range(8)]
+        embeddings.append(_seeded_unit(rng))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ref_path = Path(tmp) / "ref.jpg"
+            ref_path.write_bytes(b"synthetic-ref")
+            results = []
+            for mode in ("off", "shadow", "active"):
+                adapter = _AdapterSpy(mode)
+                pipeline = _SyntheticSessionPipeline(
+                    str(ref_path), base, embeddings, adapter
+                )
+                result = pipeline.session_check(
+                    str(ref_path),
+                    [{"sequence_no": number} for number in range(1, 10)],
+                )
+                self.assertEqual(result.session_status, "mismatch")
+                self.assertEqual(result.internal_consistency, "inconsistent")
+                self.assertEqual(result.outlier_sequence_nos, [9])
+                self.assertEqual(adapter.calls, 0)
+                results.append(result)
+
+        self.assertEqual(
+            [result.outlier_sequence_nos for result in results],
+            [[9], [9], [9]],
+        )
 
 
 if __name__ == "__main__":
