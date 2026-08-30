@@ -247,6 +247,118 @@ class EvaluateV2CandidateTests(unittest.TestCase):
             self.assertFalse(report["provenance"]["registry_entry_matches"])
             self.assertTrue(report["provenance"]["historical_digest_matches_candidate"])
 
+    def test_release_manifest_nonzero_seen_overlap_blocks_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            release_manifest = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=50,
+                sessions_per_student=2,
+            )
+            manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+            manifest["counts"]["excluded_by_reason"]["seen_student_overlap"] = 1
+            release_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+            registry_path = fixture.write_registry(release_manifest)
+
+            with _release_relative_metrics_patch():
+                with _trusted_benchmark_patch(benchmark_manifest):
+                    report = evaluate_v2_candidate(
+                        candidate_dir,
+                        release_manifest,
+                        benchmark_manifest,
+                        dataset_role="release",
+                        historical_manifest=fixture.historical_manifest,
+                        cohort_registry=registry_path,
+                        pipeline_factory=lambda: fixture.pipeline,
+                        inference_session_factory=lambda _path: fixture.inference,
+                    )
+
+            self.assertFalse(report["provenance"]["release_excluded_overlap_ok"])
+            self.assertEqual(report["cohort_status"], "insufficient_data")
+            self.assertFalse(report["release_gate_passed"])
+
+    def test_release_manifest_zero_or_missing_seen_overlap_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+
+            for overlap_value in ("missing", 0):
+                release_manifest = fixture.build_release_manifest(
+                    engineering_manifest=engineering_manifest,
+                    student_count=50,
+                    sessions_per_student=2,
+                )
+                manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+                excluded = manifest["counts"]["excluded_by_reason"]
+                if overlap_value == "missing":
+                    excluded.pop("seen_student_overlap", None)
+                else:
+                    excluded["seen_student_overlap"] = overlap_value
+                release_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+                registry_path = fixture.write_registry(release_manifest)
+
+                with self.subTest(overlap_value=overlap_value):
+                    with _release_relative_metrics_patch():
+                        with _trusted_benchmark_patch(benchmark_manifest):
+                            report = evaluate_v2_candidate(
+                                candidate_dir,
+                                release_manifest,
+                                benchmark_manifest,
+                                dataset_role="release",
+                                historical_manifest=fixture.historical_manifest,
+                                cohort_registry=registry_path,
+                                pipeline_factory=lambda: fixture.pipeline,
+                                inference_session_factory=lambda _path: fixture.inference,
+                            )
+
+                    self.assertTrue(report["provenance"]["release_excluded_overlap_ok"])
+                    self.assertEqual(report["cohort_status"], "sufficient")
+                    self.assertTrue(report["release_gate_passed"])
+
+    def test_release_manifest_malformed_seen_overlap_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+
+            for overlap_value in (True, -1, 1.5, "1"):
+                release_manifest = fixture.build_release_manifest(
+                    engineering_manifest=engineering_manifest,
+                    student_count=50,
+                    sessions_per_student=2,
+                )
+                manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+                manifest["counts"]["excluded_by_reason"]["seen_student_overlap"] = overlap_value
+                release_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+                registry_path = fixture.write_registry(release_manifest)
+
+                with self.subTest(overlap_value=overlap_value):
+                    with _release_relative_metrics_patch():
+                        with _trusted_benchmark_patch(benchmark_manifest):
+                            report = evaluate_v2_candidate(
+                                candidate_dir,
+                                release_manifest,
+                                benchmark_manifest,
+                                dataset_role="release",
+                                historical_manifest=fixture.historical_manifest,
+                                cohort_registry=registry_path,
+                                pipeline_factory=lambda: fixture.pipeline,
+                                inference_session_factory=lambda _path: fixture.inference,
+                            )
+
+                    self.assertFalse(report["provenance"]["release_excluded_overlap_ok"])
+                    self.assertEqual(report["cohort_status"], "insufficient_data")
+                    self.assertFalse(report["release_gate_passed"])
+
     def test_rejects_self_consistent_benchmark_replacement_without_replay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

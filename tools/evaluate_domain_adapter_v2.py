@@ -464,8 +464,11 @@ def _provenance_report(
             _registry_checks(dataset, cohort_registry)
         )
         excluded_hashes |= other_registry_hashes
+    manifest_seen_overlap_ok = _release_manifest_seen_overlap_ok(dataset)
     release_excluded_overlap_ok = (
-        historical_student_overlap_free and registry_hashes_unique_to_current
+        manifest_seen_overlap_ok
+        and historical_student_overlap_free
+        and registry_hashes_unique_to_current
         if dataset_role == "release"
         else True
     )
@@ -658,6 +661,19 @@ def _registry_checks(
                 reused = True
             other_hashes |= cohort_hashes
     return current_match_count == 1 and current_exact, not reused, other_hashes
+
+
+def _release_manifest_seen_overlap_ok(dataset: dict[str, Any]) -> bool:
+    counts = dataset.get("counts")
+    if not isinstance(counts, dict):
+        return False
+    excluded = counts.get("excluded_by_reason", {})
+    if not isinstance(excluded, dict):
+        return False
+    value = excluded.get("seen_student_overlap", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return False
+    return value == 0
 
 
 def _release_time_bounds_valid(dataset: dict[str, Any]) -> bool:
