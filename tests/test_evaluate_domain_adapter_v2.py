@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -13,6 +14,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from tools.evaluate_domain_adapter import _evaluate_rows
 from tools.evaluate_domain_adapter_v2 import (
     _absolute_gate_passes,
     _relative_gate_passes,
@@ -146,6 +148,85 @@ class RelativeGateTests(unittest.TestCase):
 
 
 class EvaluateV2CandidateTests(unittest.TestCase):
+    def test_raw_metrics_ignore_ambient_active_and_shadow_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+
+            seen_modes: list[str] = []
+
+            def build_pipeline() -> _AmbientModePipeline:
+                seen_modes.append(os.environ.get("FACE_DOMAIN_ADAPTER_MODE", ""))
+                return _AmbientModePipeline(
+                    fixture.pipeline,
+                    os.environ.get("FACE_DOMAIN_ADAPTER_MODE", ""),
+                )
+
+            for ambient_mode in ("active", "shadow"):
+                with self.subTest(ambient_mode=ambient_mode):
+                    with patch.dict(
+                        os.environ,
+                        {"FACE_DOMAIN_ADAPTER_MODE": ambient_mode},
+                        clear=False,
+                    ):
+                        with patch(
+                            "tools.evaluate_domain_adapter_v2.build_pipeline_from_env",
+                            side_effect=build_pipeline,
+                        ):
+                            with patch(
+                                "tools.evaluate_domain_adapter_v2.ENGINEERING_DATASET_FILE_SHA256",
+                                _file_sha256(engineering_manifest),
+                            ):
+                                with _trusted_benchmark_patch(benchmark_manifest):
+                                    report = evaluate_v2_candidate(
+                                        candidate_dir,
+                                        engineering_manifest,
+                                        benchmark_manifest,
+                                        dataset_role="engineering",
+                                        historical_manifest=None,
+                                        inference_session_factory=lambda _path: fixture.inference,
+                                    )
+
+                    self.assertEqual(
+                        report["absolute_metrics"]["raw_conditional_accuracy"],
+                        1.0,
+                    )
+                    self.assertEqual(
+                        report["absolute_metrics"]["raw_cross_student_far"],
+                        0.0,
+                    )
+
+            self.assertEqual(seen_modes, ["off", "off"])
+
+    def test_evaluate_rows_prefers_raw_session_status_when_present(self) -> None:
+        row = {
+            "student_id": "student-1",
+            "session_id": "session-1",
+            "label": "mismatch",
+            "ref_image_path": "ignored",
+            "photos": [],
+        }
+        pipeline = SimpleNamespace(
+            session_check=lambda _ref, _photos: SimpleNamespace(
+                session_status="match",
+                raw_session_status="mismatch",
+                internal_consistency="unknown",
+            )
+        )
+        scorer = SimpleNamespace(
+            dimension=1,
+            score=lambda refs, photos: np.empty((0,), dtype=np.float32),
+            classify=lambda _score: "match",
+        )
+
+        evaluated = _evaluate_rows([row], pipeline, scorer)
+
+        self.assertEqual(evaluated[0].raw_status, "mismatch")
+        self.assertEqual(evaluated[0].adapted_status, "mismatch")
+
     def test_engineering_success_never_becomes_release_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1292,6 +1373,37 @@ class _EvaluationPipeline:
             passes_gate=True,
             _embedding=self._vectors[str(photo["image_path"])],
         )
+
+
+class _AmbientModePipeline:
+    def __init__(self, base: _EvaluationPipeline, mode: str) -> None:
+        self._base = base
+        self._mode = mode
+
+    def session_check(
+        self, ref_image_path: str, photos: list[dict[str, object]]
+    ) -> SimpleNamespace:
+        result = self._base.session_check(ref_image_path, photos)
+        raw_status = result.session_status
+        if self._mode == "active" and raw_status == "match":
+            return SimpleNamespace(
+                session_status="mismatch",
+                raw_session_status=raw_status,
+                internal_consistency=result.internal_consistency,
+            )
+        if self._mode == "shadow":
+            return SimpleNamespace(
+                session_status=raw_status,
+                raw_session_status=raw_status,
+                internal_consistency=result.internal_consistency,
+            )
+        return SimpleNamespace(
+            session_status=raw_status,
+            internal_consistency=result.internal_consistency,
+        )
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._base, name)
 
 
 class _BoostingAdapterSession:

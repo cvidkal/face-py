@@ -272,6 +272,25 @@ def _truth(row: dict[str, Any]) -> str:
     return str(truth)
 
 
+def _build_evaluation_pipeline() -> Any:
+    previous_mode = os.environ.get("FACE_DOMAIN_ADAPTER_MODE")
+    try:
+        os.environ["FACE_DOMAIN_ADAPTER_MODE"] = "off"
+        return build_pipeline_from_env()
+    finally:
+        if previous_mode is None:
+            os.environ.pop("FACE_DOMAIN_ADAPTER_MODE", None)
+        else:
+            os.environ["FACE_DOMAIN_ADAPTER_MODE"] = previous_mode
+
+
+def _raw_stage_two_status(raw: Any) -> str:
+    raw_status = getattr(raw, "raw_session_status", "")
+    if raw_status not in (None, ""):
+        return str(raw_status)
+    return str(getattr(raw, "session_status", ""))
+
+
 def _evaluate_rows(
     rows: Iterable[dict[str, Any]], pipeline: Any, scorer: _AdapterScorer
 ) -> list[_EvaluatedSession]:
@@ -284,8 +303,7 @@ def _evaluate_rows(
         if not isinstance(photos, list):
             raise ValueError("evaluation session photos must be a list")
         raw = pipeline.session_check(ref_path, photos)
-        raw_status = getattr(raw, "session_status", "")
-        consistency = getattr(raw, "internal_consistency", "")
+        raw_status = _raw_stage_two_status(raw)
         if raw_status not in _PREDICTIONS:
             raise ValueError(f"raw Stage 1/2 returned invalid status: {raw_status!r}")
         raw_staged.append((row, raw))
@@ -309,7 +327,7 @@ def _evaluate_rows(
     score_index = 0
     evaluated: list[_EvaluatedSession] = []
     for row, raw, ref, prototype in staged:
-        raw_status = str(raw.session_status)
+        raw_status = _raw_stage_two_status(raw)
         consistency = str(raw.internal_consistency)
         applied = ref is not None and prototype is not None
         adapted_status = scorer.classify(float(scores[score_index])) if applied else raw_status
@@ -591,7 +609,7 @@ def evaluate_release_candidate(
     benchmark_archive: Path,
     benchmark_manifest_sha256: str,
     *,
-    pipeline_factory: Callable[[], Any] = build_pipeline_from_env,
+    pipeline_factory: Callable[[], Any] = _build_evaluation_pipeline,
     inference_session_factory: Callable[[Path], Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a provenance-bound candidate on unseen students and benchmark data."""

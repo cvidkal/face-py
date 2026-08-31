@@ -57,6 +57,18 @@ MIN_RELEASE_ELIGIBLE_MATCH_SESSIONS = 100
 MIN_RELEASE_ORDERED_CROSS_STUDENT_PAIRS = 2000
 
 
+def _build_evaluation_pipeline() -> Any:
+    previous_mode = os.environ.get("FACE_DOMAIN_ADAPTER_MODE")
+    try:
+        os.environ["FACE_DOMAIN_ADAPTER_MODE"] = "off"
+        return build_pipeline_from_env()
+    finally:
+        if previous_mode is None:
+            os.environ.pop("FACE_DOMAIN_ADAPTER_MODE", None)
+        else:
+            os.environ["FACE_DOMAIN_ADAPTER_MODE"] = previous_mode
+
+
 def _absolute_gate_passes(metrics: dict[str, Any]) -> bool:
     return (
         metrics["student_split_leaks"] == 0
@@ -117,7 +129,7 @@ def evaluate_v2_candidate(
         raise ValueError("dataset manifest evaluation_sessions must be a list")
 
     if pipeline_factory is None:
-        pipeline_factory = build_pipeline_from_env
+        pipeline_factory = _build_evaluation_pipeline
     if inference_session_factory is None:
         inference_session_factory = _load_onnx_session
     scorer = _AdapterScorer(inference_session_factory(onnx_path), artifact)
