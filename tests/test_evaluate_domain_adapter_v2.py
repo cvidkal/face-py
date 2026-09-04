@@ -17,6 +17,7 @@ import numpy as np
 from tools.evaluate_domain_adapter import _evaluate_rows
 from tools.evaluate_domain_adapter_v2 import (
     _absolute_gate_passes,
+    _canonical_training_dataset_sha256,
     _relative_gate_passes,
     evaluate_v2_candidate,
     main as evaluation_main,
@@ -328,7 +329,53 @@ class EvaluateV2CandidateTests(unittest.TestCase):
             self.assertFalse(report["provenance"]["registry_entry_matches"])
             self.assertTrue(report["provenance"]["historical_digest_matches_candidate"])
 
-    def test_release_manifest_nonzero_seen_overlap_blocks_release(self) -> None:
+    def test_release_matches_candidate_against_canonical_training_view(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            candidate_dir, engineering_manifest, benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            historical = json.loads(fixture.historical_manifest.read_text(encoding="utf-8"))
+            canonical_training_view = {
+                "schema_version": 1,
+                "snapshot": historical["snapshot"],
+                "split_seed": historical["split_seed"],
+                "sessions": [],
+                "evaluation_sessions": [],
+            }
+            artifact_path = candidate_dir / "identity_domain_adapter.manifest.json"
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            training_digest = _canonical_sha256(canonical_training_view)
+            artifact["source_dataset_sha256"] = training_digest
+            artifact["training"]["canonical_dataset_digest"] = training_digest
+            artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+            release_manifest = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=50,
+                sessions_per_student=2,
+            )
+            registry_path = fixture.write_registry(release_manifest)
+
+            with _release_relative_metrics_patch():
+                with _trusted_benchmark_patch(benchmark_manifest):
+                    report = evaluate_v2_candidate(
+                        candidate_dir,
+                        release_manifest,
+                        benchmark_manifest,
+                        dataset_role="release",
+                        historical_manifest=fixture.historical_manifest,
+                        cohort_registry=registry_path,
+                        pipeline_factory=lambda: fixture.pipeline,
+                        inference_session_factory=lambda _path: fixture.inference,
+                    )
+
+            self.assertTrue(
+                report["provenance"]["historical_digest_matches_candidate"]
+            )
+            self.assertTrue(report["release_gate_passed"])
+
+    def test_release_manifest_nonzero_seen_overlap_records_successful_exclusion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixture = _V2Fixture(root)
@@ -358,9 +405,9 @@ class EvaluateV2CandidateTests(unittest.TestCase):
                         inference_session_factory=lambda _path: fixture.inference,
                     )
 
-            self.assertFalse(report["provenance"]["release_excluded_overlap_ok"])
-            self.assertEqual(report["cohort_status"], "insufficient_data")
-            self.assertFalse(report["release_gate_passed"])
+            self.assertTrue(report["provenance"]["release_excluded_overlap_ok"])
+            self.assertEqual(report["cohort_status"], "sufficient")
+            self.assertTrue(report["release_gate_passed"])
 
     def test_release_manifest_zero_or_missing_seen_overlap_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -967,7 +1014,7 @@ class _V2Fixture:
         self.historical_manifest.write_text(json.dumps(dataset), encoding="utf-8")
         self._write_candidate_manifest(
             candidate_dir,
-            training_digest=_canonical_sha256(dataset),
+            training_digest=_canonical_training_dataset_sha256(dataset),
             dimension=1024,
             adapted_threshold=0.40,
             raw_threshold=0.35,

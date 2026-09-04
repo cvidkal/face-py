@@ -21,7 +21,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from module.face.pipeline import build_pipeline_from_env  # noqa: E402
-from tools.domain_adapter_training import SessionEmbedding  # noqa: E402
+from tools.domain_adapter_training import (  # noqa: E402
+    SessionEmbedding,
+    manifest_training_rows,
+)
 from tools.domain_adapter_v2_metrics import (  # noqa: E402
     build_v2_pair_set,
     compare_at_far_budget,
@@ -461,7 +464,10 @@ def _provenance_report(
     if dataset_role == "release" and historical_manifest is not None:
         historical = _load_json_object(historical_manifest, "historical manifest")
         historical_digest = _canonical_sha256(historical)
-        historical_digest_matches_candidate = historical_digest == candidate_training_digest
+        historical_digest_matches_candidate = (
+            _canonical_training_dataset_sha256(historical)
+            == candidate_training_digest
+        )
         historical_manifest_matches_release = (
             str(dataset.get("historical_manifest_digest", "")) == historical_digest
         )
@@ -476,7 +482,7 @@ def _provenance_report(
             _registry_checks(dataset, cohort_registry)
         )
         excluded_hashes |= other_registry_hashes
-    manifest_seen_overlap_ok = _release_manifest_seen_overlap_ok(dataset)
+    manifest_seen_overlap_ok = _release_manifest_seen_overlap_count_valid(dataset)
     release_excluded_overlap_ok = (
         manifest_seen_overlap_ok
         and historical_student_overlap_free
@@ -675,7 +681,31 @@ def _registry_checks(
     return current_match_count == 1 and current_exact, not reused, other_hashes
 
 
-def _release_manifest_seen_overlap_ok(dataset: dict[str, Any]) -> bool:
+def _canonical_training_dataset_sha256(manifest: dict[str, Any]) -> str:
+    source = {
+        "schema_version": manifest.get("schema_version"),
+        "snapshot": manifest.get("snapshot", ""),
+        "split_seed": manifest.get("split_seed", ""),
+        "sessions": manifest.get("sessions", []),
+        "evaluation_sessions": [],
+    }
+    rows = [
+        dict(row)
+        for row in manifest_training_rows(source)
+        if row["split"] in {"train", "validation"}
+    ]
+    return _canonical_sha256(
+        {
+            "schema_version": 1,
+            "snapshot": source["snapshot"],
+            "split_seed": source["split_seed"],
+            "sessions": rows,
+            "evaluation_sessions": [],
+        }
+    )
+
+
+def _release_manifest_seen_overlap_count_valid(dataset: dict[str, Any]) -> bool:
     counts = dataset.get("counts")
     if not isinstance(counts, dict):
         return False
@@ -685,7 +715,7 @@ def _release_manifest_seen_overlap_ok(dataset: dict[str, Any]) -> bool:
     value = excluded.get("seen_student_overlap", 0)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return False
-    return value == 0
+    return True
 
 
 def _release_time_bounds_valid(dataset: dict[str, Any]) -> bool:
