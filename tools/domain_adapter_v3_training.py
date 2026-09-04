@@ -26,6 +26,8 @@ from tools.domain_adapter_training import (
 from tools.domain_adapter_v2_metrics import (
     CalibratedThreshold,
     V2PairSet,
+    _iter_bootstrap_sample_counts,
+    _top_k_higher_quantile_values,
     assign_training_folds,
     bootstrap_seed,
     build_v2_pair_set,
@@ -35,6 +37,7 @@ from tools.domain_adapter_v2_metrics import (
 from tools.domain_adapter_v2_training import (
     FoldEpochMetrics,
     InsufficientDataError,
+    NoFeasibleEpochError,
     V2Selection,
     _canonical_dataset_digest,
     _canonical_training_manifest,
@@ -59,7 +62,6 @@ from tools.domain_adapter_v2_training import (
     _validate_pair_set_metadata,
     _zero_like,
     score_pair_set,
-    select_v2_epoch,
 )
 from tools.domain_adapter_v3_metrics import (
     HistoricalRelativeMetrics,
@@ -161,6 +163,131 @@ class HistoricalGateError(RuntimeError):
         self.metrics = metrics
 
 
+def select_v3_epoch(
+    history: Sequence[FoldEpochMetrics],
+    dataset_digest: str,
+) -> V2Selection:
+    by_epoch: dict[int, dict[int, FoldEpochMetrics]] = {}
+    for metric in history:
+        fold_history = by_epoch.setdefault(metric.epoch, {})
+        if metric.fold in fold_history:
+            raise ValueError(
+                f"duplicate fold history for epoch {metric.epoch}, fold {metric.fold}"
+            )
+        fold_history[metric.fold] = metric
+
+    expected_folds = set(range(5))
+    candidates: list[tuple[int, tuple[FoldEpochMetrics, ...]]] = []
+    pooled_group_ids: tuple[str, ...] | None = None
+    pooled_accepts: list[tuple[bool, ...]] = []
+    for epoch in sorted(by_epoch):
+        fold_history = by_epoch[epoch]
+        if set(fold_history) != expected_folds:
+            raise ValueError(f"epoch {epoch} is missing one or more fold metrics")
+        ordered = tuple(fold_history[fold] for fold in range(5))
+        if any(metric.empirical_far > 0.005 for metric in ordered):
+            continue
+        if any(metric.candidate_threshold < 0.35 for metric in ordered):
+            continue
+        group_ids = tuple(
+            group_id for metric in ordered for group_id in metric.negative_group_ids
+        )
+        accepts = tuple(
+            accepted for metric in ordered for accepted in metric.negative_accepts
+        )
+        if not group_ids or len(group_ids) != len(accepts):
+            raise ValueError(f"epoch {epoch} negative group data is incomplete")
+        if any(not str(group_id) for group_id in group_ids):
+            raise ValueError(f"epoch {epoch} negative group IDs must be non-empty")
+        if pooled_group_ids is None:
+            pooled_group_ids = group_ids
+        elif group_ids != pooled_group_ids:
+            raise ValueError("negative group order must remain fixed across epochs")
+        candidates.append((epoch, ordered))
+        pooled_accepts.append(accepts)
+
+    if not candidates or pooled_group_ids is None:
+        raise NoFeasibleEpochError(
+            "no feasible epoch satisfies all fold safety constraints"
+        )
+
+    group_order = tuple(dict.fromkeys(pooled_group_ids))
+    group_indices = {group_id: index for index, group_id in enumerate(group_order)}
+    group_sizes = np.zeros(len(group_order), dtype=np.int64)
+    for group_id in pooled_group_ids:
+        group_sizes[group_indices[group_id]] += 1
+    accept_counts = np.zeros(
+        (len(group_order), len(candidates)),
+        dtype=np.int64,
+    )
+    for candidate_index, accepts in enumerate(pooled_accepts):
+        for group_id, accepted in zip(pooled_group_ids, accepts, strict=True):
+            accept_counts[group_indices[group_id], candidate_index] += int(accepted)
+
+    iterations = 10000
+    retain_count = iterations - int(math.ceil((iterations - 1) * 0.95))
+    top_values = np.full(
+        (retain_count, len(candidates)),
+        -np.inf,
+        dtype=np.float64,
+    )
+    generator = np.random.default_rng(bootstrap_seed(dataset_digest))
+    for sample_counts in _iter_bootstrap_sample_counts(
+        generator,
+        group_count=len(group_order),
+        iterations=iterations,
+        batch_size=128,
+    ):
+        sampled_sizes = sample_counts @ group_sizes
+        sampled_accepts = sample_counts @ accept_counts
+        replicates = sampled_accepts / sampled_sizes[:, None]
+        top_values[...] = _top_k_higher_quantile_values(
+            top_values,
+            replicates,
+            retain_count,
+        )
+    upper_95 = np.min(top_values, axis=0)
+
+    best_key: tuple[float, float, float, float, int] | None = None
+    best_selection: V2Selection | None = None
+    for candidate_index, (epoch, ordered) in enumerate(candidates):
+        pooled_far_upper_95 = float(upper_95[candidate_index])
+        if pooled_far_upper_95 > 0.01:
+            continue
+        recalls = [metric.student_balanced_recall for metric in ordered]
+        median_recall = float(np.median(np.asarray(recalls, dtype=np.float64)))
+        worst_recall = float(min(recalls))
+        mean_drift = float(
+            np.mean([metric.residual_drift for metric in ordered], dtype=np.float64)
+        )
+        mean_validation_loss = float(
+            np.mean([metric.validation_loss for metric in ordered], dtype=np.float64)
+        )
+        key = (
+            median_recall,
+            worst_recall,
+            -mean_drift,
+            -mean_validation_loss,
+            -epoch,
+        )
+        if best_key is not None and key <= best_key:
+            continue
+        best_key = key
+        best_selection = V2Selection(
+            epoch=epoch,
+            median_recall=median_recall,
+            worst_fold_recall=worst_recall,
+            pooled_far_upper_95=pooled_far_upper_95,
+            residual_drift=mean_drift,
+            validation_loss=mean_validation_loss,
+        )
+    if best_selection is None:
+        raise NoFeasibleEpochError(
+            "no feasible epoch satisfies all fold safety constraints"
+        )
+    return best_selection
+
+
 def train_v3_candidate(
     manifest: dict[str, Any],
     embedding_cache: Path,
@@ -256,7 +383,7 @@ def train_v3_candidate(
                 for name, value in model.state_dict().items()
             }
 
-    selection = select_v2_epoch(fold_history, selection_digest)
+    selection = select_v3_epoch(fold_history, selection_digest)
     oof_scores = _selected_oof_scores(
         held_out_pair_sets,
         checkpoints,

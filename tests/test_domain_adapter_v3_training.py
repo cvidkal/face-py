@@ -15,7 +15,7 @@ from module.face.domain_adapter import DomainAdapterRuntime
 from tools.domain_adapter_training import LowRankDomainAdapter, PairMetadata, SessionEmbedding
 from tools.domain_adapter_v2_metrics import V2PairSet
 from tools.domain_adapter_v2_metrics import CalibratedThreshold
-from tools.domain_adapter_v2_training import V2Selection
+from tools.domain_adapter_v2_training import FoldEpochMetrics, V2Selection, select_v2_epoch
 from tools.domain_adapter_v3_training import (
     HistoricalGateError,
     OofScores,
@@ -28,6 +28,7 @@ from tools.domain_adapter_v3_training import (
     continue_after_historical_oof,
     historical_metrics_from_oof,
     require_historical_gate,
+    select_v3_epoch,
     train_v3_epoch,
     train_v3_candidate,
     v3_separation_loss,
@@ -240,6 +241,46 @@ class V3HistoricalGateTests(unittest.TestCase):
                 continue_fn=later,
             )
         self.assertFalse(called)
+
+
+class V3EpochSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _history() -> tuple[FoldEpochMetrics, ...]:
+        return tuple(
+            FoldEpochMetrics(
+                fold=fold,
+                epoch=epoch,
+                candidate_threshold=0.35,
+                empirical_far=0.0,
+                student_balanced_recall=0.4 + 0.1 * epoch - 0.01 * fold,
+                validation_loss=0.3 - 0.05 * epoch,
+                residual_drift=0.01 * epoch,
+                negative_group_ids=tuple(
+                    f"G{fold}-{index // 2}" for index in range(200)
+                ),
+                negative_accepts=tuple(
+                    epoch >= 2 and index == 0 for index in range(200)
+                ),
+            )
+            for epoch in (1, 2, 3)
+            for fold in range(5)
+        )
+
+    def test_batched_bootstrap_is_exactly_equivalent_to_v2_selection(self) -> None:
+        history = self._history()
+        digest = "d" * 64
+        expected = select_v2_epoch(history, digest)
+
+        from tools.domain_adapter_v2_metrics import _iter_bootstrap_sample_counts
+
+        with patch(
+            "tools.domain_adapter_v3_training._iter_bootstrap_sample_counts",
+            wraps=_iter_bootstrap_sample_counts,
+        ) as draws:
+            actual = select_v3_epoch(history, digest)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(draws.call_count, 1)
 
 
 class V3ArtifactTests(unittest.TestCase):
@@ -487,7 +528,7 @@ class V3CandidateTrainingTests(unittest.TestCase):
                     return_value=1000,
                 ),
                 patch(
-                    "tools.domain_adapter_v3_training.select_v2_epoch",
+                    "tools.domain_adapter_v3_training.select_v3_epoch",
                     return_value=selection,
                 ),
                 patch(
