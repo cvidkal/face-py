@@ -173,9 +173,12 @@ def classify_match(cos: float, l2: float,
     """
     if cos_mismatch_thresh is None or cos_match_thresh is None or l2_max_thresh is None:
         env_lo, env_hi, env_l2 = get_match_thresholds()
-        if cos_mismatch_thresh is None: cos_mismatch_thresh = env_lo
-        if cos_match_thresh is None:    cos_match_thresh = env_hi
-        if l2_max_thresh is None:       l2_max_thresh = env_l2
+        if cos_mismatch_thresh is None:
+            cos_mismatch_thresh = env_lo
+        if cos_match_thresh is None:
+            cos_match_thresh = env_hi
+        if l2_max_thresh is None:
+            l2_max_thresh = env_l2
     if cos < cos_mismatch_thresh:
         return "mismatch"
     if cos >= cos_match_thresh and l2 <= l2_max_thresh:
@@ -193,6 +196,8 @@ def is_same_person(cos: float, l2: float,
     """
     if cos_thresh is None or l2_thresh is None:
         _, env_cos, env_l2 = get_match_thresholds()
-        if cos_thresh is None: cos_thresh = env_cos
-        if l2_thresh is None:  l2_thresh = env_l2
+        if cos_thresh is None:
+            cos_thresh = env_cos
+        if l2_thresh is None:
+            l2_thresh = env_l2
     return cos >= cos_thresh and l2 <= l2_thresh
