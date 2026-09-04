@@ -120,8 +120,8 @@ def apply_session_match_consensus(photo_results: Sequence["SessionPhotoResult"])
     """Promote eligible per-photo inconclusive results to match.
 
     This is a disabled-by-default production-shaped helper for later isolated
-    evaluation. It only mutates `match_status` on eligible photos and returns the
-    number of changed rows.
+    evaluation. It normalizes the promoted status and its obsolete inconclusive
+    error fields, then returns the number of changed rows.
     """
     items = list(photo_results)
     changed = 0
@@ -130,6 +130,8 @@ def apply_session_match_consensus(photo_results: Sequence["SessionPhotoResult"])
         if not _eligible_for_session_match_consensus(photo, peers):
             continue
         photo.match_status = "match"
+        photo.error_code = ""
+        photo.error = ""
         changed += 1
     return changed
 

@@ -18,6 +18,7 @@ from tools.evaluate_domain_adapter import _evaluate_rows
 from tools.evaluate_domain_adapter_v2 import (
     _absolute_gate_passes,
     _canonical_training_dataset_sha256,
+    _registry_checks,
     _relative_gate_passes,
     evaluate_v2_candidate,
     main as evaluation_main,
@@ -328,6 +329,68 @@ class EvaluateV2CandidateTests(unittest.TestCase):
             self.assertFalse(report["release_gate_passed"])
             self.assertFalse(report["provenance"]["registry_entry_matches"])
             self.assertTrue(report["provenance"]["historical_digest_matches_candidate"])
+
+    def test_registry_checks_reject_malformed_or_overlapping_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _V2Fixture(root)
+            _candidate_dir, engineering_manifest, _benchmark_manifest = (
+                fixture.build_engineering_fixture()
+            )
+            release_manifest_path = fixture.build_release_manifest(
+                engineering_manifest=engineering_manifest,
+                student_count=2,
+                sessions_per_student=1,
+            )
+            release_manifest = json.loads(
+                release_manifest_path.read_text(encoding="utf-8")
+            )
+            registry_path = fixture.write_registry(release_manifest_path)
+            valid_registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            current = valid_registry["cohorts"][0]
+
+            malformed_registries: dict[str, dict[str, object]] = {}
+
+            invalid_hash = json.loads(json.dumps(valid_registry))
+            invalid_hash["cohorts"][0]["student_hashes"][0] = "not-a-hash"
+            malformed_registries["invalid_hash"] = invalid_hash
+
+            duplicate_hash = json.loads(json.dumps(valid_registry))
+            duplicate_hash["cohorts"][0]["student_hashes"].append(
+                duplicate_hash["cohorts"][0]["student_hashes"][0]
+            )
+            malformed_registries["duplicate_hash"] = duplicate_hash
+
+            duplicate_id = json.loads(json.dumps(valid_registry))
+            duplicate_id["cohorts"].append(
+                {
+                    **current,
+                    "student_hashes": [_student_hash("another-student")],
+                }
+            )
+            malformed_registries["duplicate_cohort_id"] = duplicate_id
+
+            reversed_bounds = json.loads(json.dumps(valid_registry))
+            reversed_bounds["cohorts"][0]["after"] = "2026-09-01T00:00:00+00:00"
+            malformed_registries["reversed_bounds"] = reversed_bounds
+
+            overlapping_bounds = json.loads(json.dumps(valid_registry))
+            overlapping_bounds["cohorts"].insert(
+                0,
+                {
+                    "cohort_id": "release-prior-overlap",
+                    "after": "2026-08-29T00:00:00+00:00",
+                    "through": "2026-08-30T06:00:00+00:00",
+                    "student_hashes": [_student_hash("prior-student")],
+                },
+            )
+            malformed_registries["overlapping_bounds"] = overlapping_bounds
+
+            for name, malformed in malformed_registries.items():
+                with self.subTest(name=name):
+                    registry_path.write_text(json.dumps(malformed), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        _registry_checks(release_manifest, registry_path)
 
     def test_release_matches_candidate_against_canonical_training_view(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -739,20 +802,20 @@ class EvaluateV2CandidateTests(unittest.TestCase):
 
             with _release_relative_metrics_patch():
                 with _trusted_benchmark_patch(benchmark_manifest):
-                    report = evaluate_v2_candidate(
-                        candidate_dir,
-                        release_manifest,
-                        benchmark_manifest,
-                        dataset_role="release",
-                        historical_manifest=fixture.historical_manifest,
-                        cohort_registry=registry_path,
-                        pipeline_factory=lambda: fixture.pipeline,
-                        inference_session_factory=lambda _path: fixture.inference,
-                    )
-
-            self.assertFalse(report["provenance"]["registry_hashes_unique_to_current"])
-            self.assertEqual(report["cohort_status"], "insufficient_data")
-            self.assertFalse(report["release_gate_passed"])
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "duplicate student hash across cohort registry",
+                    ):
+                        evaluate_v2_candidate(
+                            candidate_dir,
+                            release_manifest,
+                            benchmark_manifest,
+                            dataset_role="release",
+                            historical_manifest=fixture.historical_manifest,
+                            cohort_registry=registry_path,
+                            pipeline_factory=lambda: fixture.pipeline,
+                            inference_session_factory=lambda _path: fixture.inference,
+                        )
 
     def test_report_never_leaks_raw_identifiers_paths_or_group_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

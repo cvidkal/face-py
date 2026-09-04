@@ -654,18 +654,66 @@ def _registry_checks(
     if not isinstance(cohorts, list):
         raise ValueError("cohort registry cohorts must be a list")
 
+    validated_cohorts: list[tuple[dict[str, Any], set[str]]] = []
+    seen_cohort_ids: set[str] = set()
+    seen_student_hashes: set[str] = set()
+    previous_through: datetime | None = None
+    for index, cohort in enumerate(cohorts):
+        if not isinstance(cohort, dict):
+            raise ValueError("cohort registry cohort entries must be objects")
+        cohort_id = cohort.get("cohort_id")
+        if not isinstance(cohort_id, str) or not cohort_id.strip():
+            raise ValueError(f"cohort registry cohort {index} requires cohort_id")
+        if cohort_id in seen_cohort_ids:
+            raise ValueError(f"duplicate cohort registry cohort_id: {cohort_id}")
+        seen_cohort_ids.add(cohort_id)
+
+        try:
+            after = _parse_timestamp(str(cohort.get("after", "")))
+            through = _parse_timestamp(str(cohort.get("through", "")))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"cohort registry cohort {cohort_id} has invalid time bounds"
+            ) from exc
+        if not after < through:
+            raise ValueError(
+                f"cohort registry cohort {cohort_id} must have after before through"
+            )
+        if previous_through is not None and after < previous_through:
+            raise ValueError(
+                f"cohort registry cohort {cohort_id} overlaps earlier bounds"
+            )
+        previous_through = through
+
+        cohort_hashes_raw = cohort.get("student_hashes")
+        if not isinstance(cohort_hashes_raw, list):
+            raise ValueError("cohort registry cohort student_hashes must be a list")
+        cohort_hashes: set[str] = set()
+        for raw_hash in cohort_hashes_raw:
+            if (
+                not isinstance(raw_hash, str)
+                or len(raw_hash) != 64
+                or any(char not in "0123456789abcdef" for char in raw_hash)
+            ):
+                raise ValueError(
+                    "cohort registry student hashes must be lowercase SHA-256 hex"
+                )
+            if raw_hash in cohort_hashes:
+                raise ValueError(
+                    f"duplicate student hash in cohort registry cohort {cohort_id}"
+                )
+            if raw_hash in seen_student_hashes:
+                raise ValueError("duplicate student hash across cohort registry")
+            cohort_hashes.add(raw_hash)
+            seen_student_hashes.add(raw_hash)
+        validated_cohorts.append((cohort, cohort_hashes))
+
     expected_hashes = sorted(_current_cohort_student_hashes(dataset))
     current_exact = False
     current_match_count = 0
     other_hashes: set[str] = set()
     reused = False
-    for cohort in cohorts:
-        if not isinstance(cohort, dict):
-            raise ValueError("cohort registry cohort entries must be objects")
-        cohort_hashes_raw = cohort.get("student_hashes")
-        if not isinstance(cohort_hashes_raw, list):
-            raise ValueError("cohort registry cohort student_hashes must be a list")
-        cohort_hashes = {str(value) for value in cohort_hashes_raw}
+    for cohort, cohort_hashes in validated_cohorts:
         is_current = (
             cohort.get("cohort_id") == dataset.get("cohort_id")
             and cohort.get("after") == dataset.get("after")
@@ -735,38 +783,6 @@ def _parse_timestamp(raw: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("timestamp must include timezone")
     return parsed
-
-
-def _registry_entry_matches(dataset: dict[str, Any], cohort_registry: Path) -> bool:
-    try:
-        registry = _load_json_object(cohort_registry, "cohort registry")
-    except ValueError:
-        return False
-    if registry.get("schema_version") != RELEASE_REGISTRY_SCHEMA_VERSION:
-        return False
-    if registry.get("hash_scheme") != RELEASE_REGISTRY_HASH_SCHEME:
-        return False
-    expected_hashes = sorted(
-        {
-            _student_hash(str(row.get("student_id", "")))
-            for row in dataset.get("evaluation_sessions", [])
-            if isinstance(row, dict) and str(row.get("student_id", ""))
-        }
-    )
-    cohorts = registry.get("cohorts")
-    if not isinstance(cohorts, list):
-        return False
-    for cohort in cohorts:
-        if not isinstance(cohort, dict):
-            continue
-        if (
-            cohort.get("cohort_id") == dataset.get("cohort_id")
-            and cohort.get("after") == dataset.get("after")
-            and cohort.get("through") == dataset.get("through")
-            and sorted(str(item) for item in cohort.get("student_hashes", [])) == expected_hashes
-        ):
-            return True
-    return False
 
 
 def _student_hash(student_id: str) -> str:

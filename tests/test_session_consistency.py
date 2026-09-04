@@ -257,6 +257,7 @@ class SessionMatchConsensusRuleTests(unittest.TestCase):
             cosine=0.32,
             error_code=COS_INCONCLUSIVE_ZONE,
         )
+        candidate.error = "cosine score is inconclusive"
         peers = [
             _photo(sequence_no=2, status="match", cosine=0.40),
             _photo(sequence_no=3, status="match", cosine=0.45),
@@ -266,7 +267,8 @@ class SessionMatchConsensusRuleTests(unittest.TestCase):
 
         self.assertEqual(changed, 1)
         self.assertEqual(candidate.match_status, "match")
-        self.assertEqual(candidate.error_code, COS_INCONCLUSIVE_ZONE)
+        self.assertEqual(candidate.error_code, "")
+        self.assertEqual(candidate.error, "")
 
     def test_consensus_rejects_non_inconclusive_candidates(self) -> None:
         peers = [
