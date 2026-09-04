@@ -1,19 +1,39 @@
 from __future__ import annotations
 
+import json
+import os
 import unittest
+from dataclasses import asdict
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
-from tools.domain_adapter_training import LowRankDomainAdapter, PairMetadata
+from tools.domain_adapter_training import LowRankDomainAdapter, PairMetadata, SessionEmbedding
 from tools.domain_adapter_v2_metrics import V2PairSet
+from tools.domain_adapter_v2_metrics import CalibratedThreshold
+from tools.domain_adapter_v2_training import V2Selection
 from tools.domain_adapter_v3_training import (
+    HistoricalGateError,
+    OofScores,
+    V3TrainingResult,
     V3TrainingConfig,
+    _v3_runtime_manifest,
     _group_tail_negative_loss,
     _student_balanced_positive_loss,
     _student_balanced_ranking_loss,
+    continue_after_historical_oof,
+    historical_metrics_from_oof,
+    require_historical_gate,
+    train_v3_epoch,
+    train_v3_candidate,
     v3_separation_loss,
+    write_v3_candidate_artifacts,
 )
+from tools.domain_adapter_v3_metrics import HistoricalRelativeMetrics
+from tools.train_domain_adapter_v3 import _parser, main
 
 
 def _meta(
@@ -126,6 +146,348 @@ class V3LossTests(unittest.TestCase):
         self.assertGreater(gradient, 0.0)
         self.assertEqual(loss.tail_negative_indices.tolist(), [0])
         self.assertEqual(loss.hard_negative_indices.tolist(), [0])
+
+    def test_one_epoch_is_deterministic_from_the_same_state(self) -> None:
+        pair_set = V2PairSet(
+            positive_ref_embeddings=np.asarray([[1.0, 0.0]], dtype=np.float32),
+            positive_photo_embeddings=np.asarray([[0.0, 1.0]], dtype=np.float32),
+            positive_student_ids=("A",),
+            positive_session_ids=("A1",),
+            negative_ref_embeddings=np.asarray([[1.0, 0.0]], dtype=np.float32),
+            negative_photo_embeddings=np.asarray([[0.8, 0.6]], dtype=np.float32),
+            negative_group_ids=("A>B",),
+            negative_categories=("synthetic_cross_student",),
+            negative_weights=np.asarray([1.0], dtype=np.float32),
+            negative_metadata=(_meta("A", "A1", "B", "B1"),),
+        )
+        first = LowRankDomainAdapter(dimension=2, rank=16)
+        second = LowRankDomainAdapter(dimension=2, rank=16)
+        second.load_state_dict(first.state_dict())
+        config = V3TrainingConfig()
+        train_v3_epoch(first, torch.optim.Adam(first.parameters(), lr=0.01), pair_set, config)
+        train_v3_epoch(
+            second,
+            torch.optim.Adam(second.parameters(), lr=0.01),
+            pair_set,
+            config,
+        )
+        for first_parameter, second_parameter in zip(
+            first.parameters(), second.parameters(), strict=True
+        ):
+            torch.testing.assert_close(first_parameter, second_parameter)
+
+
+class V3HistoricalGateTests(unittest.TestCase):
+    def _metrics(self, recall_lift: float) -> HistoricalRelativeMetrics:
+        return HistoricalRelativeMetrics(
+            raw_far=0.01,
+            adapted_far=0.009,
+            recall_lift=recall_lift,
+            true_match_delta=1,
+            same_threshold_recall_delta=0.01,
+            adapted_threshold=0.35,
+        )
+
+    def test_gate_failure_contains_only_aggregate_metrics(self) -> None:
+        metrics = self._metrics(0.019)
+        with self.assertRaises(HistoricalGateError) as caught:
+            require_historical_gate(metrics)
+        self.assertEqual(caught.exception.metrics, metrics)
+        self.assertNotIn("student", str(caught.exception).lower())
+
+    def test_exact_two_point_lift_passes(self) -> None:
+        require_historical_gate(self._metrics(0.02))
+
+    def test_oof_metrics_compare_raw_and_adapted_at_the_same_far_budget(self) -> None:
+        metrics = historical_metrics_from_oof(
+            OofScores(
+                raw_positive=np.asarray([0.36, 0.34]),
+                adapted_positive=np.asarray([0.38, 0.36]),
+                positive_student_ids=("A", "B"),
+                raw_negative=np.asarray([0.10, 0.20]),
+                adapted_negative=np.asarray([0.10, 0.20]),
+                negative_group_ids=("A>B", "B>A"),
+            ),
+            dataset_digest="d" * 64,
+        )
+        self.assertEqual(metrics.raw_far, 0.0)
+        self.assertEqual(metrics.adapted_far, 0.0)
+        self.assertEqual(metrics.recall_lift, 0.5)
+        self.assertEqual(metrics.true_match_delta, 1)
+        self.assertEqual(metrics.same_threshold_recall_delta, 0.5)
+        self.assertEqual(metrics.adapted_threshold, 0.36)
+
+    def test_failed_oof_gate_never_calls_later_training_or_evidence(self) -> None:
+        scores = OofScores(
+            raw_positive=np.asarray([0.36]),
+            adapted_positive=np.asarray([0.36]),
+            positive_student_ids=("A",),
+            raw_negative=np.asarray([0.10]),
+            adapted_negative=np.asarray([0.10]),
+            negative_group_ids=("A>B",),
+        )
+        called = False
+
+        def later(_metrics: HistoricalRelativeMetrics) -> None:
+            nonlocal called
+            called = True
+
+        with self.assertRaises(HistoricalGateError):
+            continue_after_historical_oof(
+                scores,
+                dataset_digest="d" * 64,
+                continue_fn=later,
+            )
+        self.assertFalse(called)
+
+
+class V3ArtifactTests(unittest.TestCase):
+    def _result(self) -> V3TrainingResult:
+        threshold = CalibratedThreshold(
+            threshold=0.35,
+            empirical_far=0.005,
+            far_upper_95=0.009,
+            student_balanced_recall=0.5,
+            true_matches=2,
+            feasible=True,
+        )
+        return V3TrainingResult(
+            model=LowRankDomainAdapter(dimension=2, rank=16),
+            selection=V2Selection(
+                epoch=1,
+                median_recall=0.5,
+                worst_fold_recall=0.4,
+                pooled_far_upper_95=0.009,
+                residual_drift=0.01,
+                validation_loss=0.1,
+            ),
+            fold_history=(),
+            adapted_threshold=threshold,
+            raw_threshold=threshold,
+            historical_metrics=HistoricalRelativeMetrics(
+                raw_far=0.01,
+                adapted_far=0.009,
+                recall_lift=0.02,
+                true_match_delta=1,
+                same_threshold_recall_delta=0.01,
+                adapted_threshold=0.35,
+            ),
+            dataset_digest="d" * 64,
+            source_feedback_snapshot="private snapshot",
+            split_seed="split",
+            split_counts={},
+            validation_negative_category_counts={},
+            validation_negative_category_weight_totals={},
+        )
+
+    def test_public_manifest_records_v3_aggregation_without_private_rows(self) -> None:
+        result = self._result()
+        manifest = _v3_runtime_manifest(
+            result=result,
+            seed=7,
+            onnx_file="identity_domain_adapter.onnx",
+            onnx_sha256="a" * 64,
+            onnx_parity_max_abs_error=1e-7,
+        )
+        encoded = str(manifest)
+        self.assertEqual(manifest["model_version"], "identity-domain-adapter-v3")
+        self.assertEqual(
+            manifest["training"]["negative_weighting"],
+            "ordered_student_pair_current_maximum",
+        )
+        self.assertEqual(
+            manifest["training"]["positive_weighting"],
+            "equal_total_weight_per_student",
+        )
+        self.assertEqual(
+            manifest["training"]["historical_oof_relative"],
+            asdict(result.historical_metrics),
+        )
+        self.assertNotIn("private snapshot", encoded)
+        self.assertNotIn("student_id", encoded)
+        self.assertNotIn("session_id", encoded)
+
+    def test_real_onnx_artifact_is_private_and_supports_dynamic_batches(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "candidate"
+            manifest = write_v3_candidate_artifacts(output, self._result(), seed=7)
+            self.assertEqual(manifest["model_version"], "identity-domain-adapter-v3")
+            self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+            self.assertTrue(
+                all(path.stat().st_mode & 0o777 == 0o600 for path in output.iterdir())
+            )
+            self.assertLessEqual(manifest["onnx_parity_max_abs_error"], 1e-5)
+
+    def test_artifact_writer_never_overwrites_a_racing_destination(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "candidate"
+            sentinel = output / "sentinel.txt"
+
+            def create_destination() -> None:
+                output.mkdir(mode=0o700)
+                sentinel.write_text("keep-me", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                write_v3_candidate_artifacts(
+                    output,
+                    self._result(),
+                    seed=7,
+                    _before_publish=create_destination,
+                )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep-me")
+            self.assertFalse(
+                (output / "identity_domain_adapter.manifest.json").exists()
+            )
+
+    def test_cli_rejects_training_knob_overrides(self) -> None:
+        parser = _parser()
+        with patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "--manifest", "dataset.json",
+                        "--embedding-cache", "cache.npz",
+                        "--output-dir", "candidate",
+                        "--ranking-weight", "0.9",
+                    ]
+                )
+
+    def test_cli_historical_failure_writes_only_non_overwriting_aggregate_report(self) -> None:
+        metrics = HistoricalRelativeMetrics(
+            raw_far=0.01,
+            adapted_far=0.009,
+            recall_lift=0.019,
+            true_match_delta=1,
+            same_threshold_recall_delta=0.01,
+            adapted_threshold=0.35,
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "dataset.json"
+            manifest_path.write_text('{"schema_version": 1}', encoding="utf-8")
+            output = root / "candidate"
+            failure = root / "candidate.historical-gate-failure.json"
+            with patch(
+                "tools.train_domain_adapter_v3.train_v3_candidate",
+                side_effect=HistoricalGateError(metrics),
+            ):
+                exit_code = main(
+                    [
+                        "--manifest", str(manifest_path),
+                        "--embedding-cache", str(root / "cache.npz"),
+                        "--output-dir", str(output),
+                    ]
+                )
+            self.assertEqual(exit_code, 2)
+            self.assertFalse(output.exists())
+            self.assertEqual(failure.stat().st_mode & 0o777, 0o600)
+            payload = json.loads(failure.read_text(encoding="utf-8"))
+            self.assertEqual(payload["historical_oof_relative"], asdict(metrics))
+            self.assertNotIn("student", str(payload).lower())
+            self.assertNotIn("session", str(payload).lower())
+
+            sentinel = b"keep-me\n"
+            failure.write_bytes(sentinel)
+            os.chmod(failure, 0o600)
+            with patch(
+                "tools.train_domain_adapter_v3.train_v3_candidate",
+                side_effect=HistoricalGateError(metrics),
+            ):
+                with self.assertRaises(FileExistsError):
+                    main(
+                        [
+                            "--manifest", str(manifest_path),
+                            "--embedding-cache", str(root / "cache.npz"),
+                            "--output-dir", str(output),
+                        ]
+                    )
+            self.assertEqual(failure.read_bytes(), sentinel)
+
+
+class V3CandidateTrainingTests(unittest.TestCase):
+    def test_candidate_runs_v3_folds_then_returns_frozen_final_model(self) -> None:
+        sessions = tuple(
+            SessionEmbedding(
+                student_id=f"S{index}",
+                session_id=f"X{index}",
+                split="train",
+                label="match",
+                ref_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+                session_prototype=np.asarray([0.8, 0.6], dtype=np.float32),
+            )
+            for index in range(10)
+        ) + tuple(
+            SessionEmbedding(
+                student_id=f"V{index}",
+                session_id=f"VX{index}",
+                split="validation",
+                label="match",
+                ref_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+                session_prototype=np.asarray([0.8, 0.6], dtype=np.float32),
+            )
+            for index in range(2)
+        )
+        folds = {
+            fold: (sessions[fold * 2], sessions[fold * 2 + 1])
+            for fold in range(5)
+        }
+        selection = V2Selection(
+            epoch=1,
+            median_recall=0.5,
+            worst_fold_recall=0.5,
+            pooled_far_upper_95=0.009,
+            residual_drift=0.01,
+            validation_loss=0.1,
+        )
+        historical = HistoricalRelativeMetrics(
+            raw_far=0.01,
+            adapted_far=0.009,
+            recall_lift=0.02,
+            true_match_delta=1,
+            same_threshold_recall_delta=0.01,
+            adapted_threshold=0.35,
+        )
+
+        def pass_gate(_scores, *, dataset_digest, continue_fn):
+            self.assertTrue(dataset_digest)
+            return continue_fn(historical)
+
+        with TemporaryDirectory() as tmp:
+            with (
+                patch(
+                    "tools.domain_adapter_v3_training.extract_session_embeddings",
+                    return_value=sessions,
+                ),
+                patch(
+                    "tools.domain_adapter_v3_training.assign_training_folds",
+                    return_value=folds,
+                ),
+                patch("tools.domain_adapter_v3_training._validate_fold_sufficiency"),
+                patch("tools.domain_adapter_v3_training._validate_partition_size"),
+                patch(
+                    "tools.domain_adapter_v3_training._synthetic_group_count",
+                    return_value=1000,
+                ),
+                patch(
+                    "tools.domain_adapter_v3_training.select_v2_epoch",
+                    return_value=selection,
+                ),
+                patch(
+                    "tools.domain_adapter_v3_training.continue_after_historical_oof",
+                    side_effect=pass_gate,
+                ),
+            ):
+                result = train_v3_candidate(
+                    {"schema_version": 1, "sessions": []},
+                    Path(tmp) / "embedding-cache.npz",
+                    V3TrainingConfig(),
+                    seed=7,
+                    device="cpu",
+                )
+
+        self.assertEqual(result.selection.epoch, 1)
+        self.assertEqual(result.historical_metrics, historical)
+        self.assertEqual(result.model.rank, 16)
 
 
 if __name__ == "__main__":

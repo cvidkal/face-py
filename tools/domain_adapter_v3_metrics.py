@@ -47,10 +47,11 @@ def group_tail_indices(
     if not torch.isfinite(values).all():
         raise ValueError("scores must be finite")
 
+    score_values = values.detach().cpu().numpy()
     best: dict[str, tuple[float, tuple[str, str, str, str, int], int]] = {}
     for index, (group_id, row) in enumerate(zip(group_ids, metadata, strict=True)):
         candidate = (
-            float(values[index].detach().cpu()),
+            float(score_values[index]),
             _metadata_order(row, index),
             index,
         )
@@ -79,6 +80,7 @@ def distinct_photo_student_hard_negatives(
     if not torch.isfinite(values).all():
         raise ValueError("scores must be finite")
 
+    score_values = values.detach().cpu().numpy()
     best: dict[str, tuple[float, tuple[str, str, str, str, int], int]] = {}
     for index, row in enumerate(metadata):
         if (
@@ -87,7 +89,7 @@ def distinct_photo_student_hard_negatives(
         ):
             continue
         candidate = (
-            float(values[index].detach().cpu()),
+            float(score_values[index]),
             _metadata_order(row, index),
             index,
         )

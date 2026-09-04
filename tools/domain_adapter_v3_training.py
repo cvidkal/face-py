@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import os
+import tempfile
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable, TypeVar
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -14,22 +20,56 @@ from torch.nn import functional as F
 from tools.domain_adapter_training import (
     LowRankDomainAdapter,
     PairMetadata,
+    extract_session_embeddings,
     residual_weight_regularization,
 )
-from tools.domain_adapter_v2_metrics import V2PairSet
+from tools.domain_adapter_v2_metrics import (
+    CalibratedThreshold,
+    V2PairSet,
+    assign_training_folds,
+    bootstrap_seed,
+    build_v2_pair_set,
+    calibrate_threshold,
+    compare_at_far_budget,
+)
 from tools.domain_adapter_v2_training import (
+    FoldEpochMetrics,
+    InsufficientDataError,
+    V2Selection,
+    _canonical_dataset_digest,
+    _canonical_training_manifest,
     _embedding_tensor,
+    _embedding_dimension,
+    _export_v2_onnx_with_dynamic_batch_parity,
+    _fresh_model,
     _model_device,
+    _preserve_failure_evidence,
+    _public_fold_summaries,
+    _publish_directory_no_replace,
+    _raw_pair_scores,
     _require_finite_component,
+    _select_empirical_threshold,
+    _source_revision,
+    _split_counts,
+    _synthetic_group_count,
+    _train_only_manifest,
+    _validate_fold_sufficiency,
     _validate_model,
+    _validate_partition_size,
     _validate_pair_set_metadata,
     _zero_like,
+    score_pair_set,
+    select_v2_epoch,
 )
 from tools.domain_adapter_v3_metrics import (
-    distinct_photo_student_hard_negatives,
+    HistoricalRelativeMetrics,
     group_tail_indices,
+    historical_relative_gate_passes,
     student_balanced_weights,
 )
+from tools.domain_adapter_training import _atomic_write_private_json
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -87,6 +127,421 @@ class V3EpochLoss:
     ranking: float
     identity: float
     residual_drift: float
+
+
+@dataclass(frozen=True)
+class OofScores:
+    raw_positive: np.ndarray
+    adapted_positive: np.ndarray
+    positive_student_ids: tuple[str, ...]
+    raw_negative: np.ndarray
+    adapted_negative: np.ndarray
+    negative_group_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class V3TrainingResult:
+    model: LowRankDomainAdapter
+    selection: V2Selection
+    fold_history: tuple[FoldEpochMetrics, ...]
+    adapted_threshold: CalibratedThreshold
+    raw_threshold: CalibratedThreshold
+    historical_metrics: HistoricalRelativeMetrics
+    dataset_digest: str
+    source_feedback_snapshot: str
+    split_seed: str
+    split_counts: dict[str, dict[str, int]]
+    validation_negative_category_counts: dict[str, int]
+    validation_negative_category_weight_totals: dict[str, float]
+
+
+class HistoricalGateError(RuntimeError):
+    def __init__(self, metrics: HistoricalRelativeMetrics) -> None:
+        super().__init__("historical out-of-fold relative gate failed")
+        self.metrics = metrics
+
+
+def train_v3_candidate(
+    manifest: dict[str, Any],
+    embedding_cache: Path,
+    config: V3TrainingConfig,
+    seed: int,
+    device: str,
+) -> V3TrainingResult:
+    canonical_manifest = _canonical_training_manifest(manifest)
+    train_only_manifest = _train_only_manifest(canonical_manifest)
+    selection_digest = _canonical_dataset_digest(train_only_manifest)
+    dataset_digest = _canonical_dataset_digest(canonical_manifest)
+    sessions = tuple(
+        extract_session_embeddings(
+            canonical_manifest,
+            cache_path=Path(embedding_cache),
+        )
+    )
+    train_sessions = tuple(session for session in sessions if session.split == "train")
+    validation_sessions = tuple(
+        session for session in sessions if session.split == "validation"
+    )
+    folds = assign_training_folds(train_sessions)
+    _validate_fold_sufficiency(folds)
+
+    validation_pair_set = build_v2_pair_set(validation_sessions)
+    _validate_partition_size("canonical validation", validation_sessions)
+    if _synthetic_group_count(validation_pair_set) < 1000:
+        raise InsufficientDataError(
+            "canonical validation must contain at least 1000 ordered groups"
+        )
+
+    dimension = _embedding_dimension((*train_sessions, *validation_sessions))
+    fold_history: list[FoldEpochMetrics] = []
+    checkpoints: dict[tuple[int, int], dict[str, Tensor]] = {}
+    held_out_pair_sets: dict[int, V2PairSet] = {}
+    for fold in range(5):
+        held_out_sessions = folds[fold]
+        train_fold_sessions = tuple(
+            session
+            for other_fold, fold_sessions in folds.items()
+            if other_fold != fold
+            for session in fold_sessions
+        )
+        train_pair_set = build_v2_pair_set(train_fold_sessions)
+        held_out_pair_set = build_v2_pair_set(held_out_sessions)
+        held_out_pair_sets[fold] = held_out_pair_set
+        model = _fresh_model(
+            dimension=dimension,
+            rank=config.rank,
+            seed=seed,
+            device=device,
+        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+        for epoch in range(1, config.max_epochs + 1):
+            epoch_loss = train_v3_epoch(model, optimizer, train_pair_set, config)
+            validation_loss = _score_v3_validation_loss(
+                model,
+                held_out_pair_set,
+                config,
+            )
+            scores = score_pair_set(model, held_out_pair_set, device)
+            threshold = _select_empirical_threshold(
+                positive_scores=scores.positive,
+                positive_student_ids=held_out_pair_set.positive_student_ids,
+                negative_scores=scores.negative,
+                negative_group_ids=held_out_pair_set.negative_group_ids,
+            )
+            fold_history.append(
+                FoldEpochMetrics(
+                    fold=fold,
+                    epoch=epoch,
+                    candidate_threshold=threshold.threshold,
+                    empirical_far=threshold.empirical_far,
+                    student_balanced_recall=threshold.student_balanced_recall,
+                    validation_loss=validation_loss,
+                    residual_drift=epoch_loss.residual_drift,
+                    negative_group_ids=held_out_pair_set.negative_group_ids,
+                    negative_accepts=tuple(
+                        bool(score >= threshold.threshold) for score in scores.negative
+                    ),
+                    student_count=len(
+                        {session.student_id for session in held_out_sessions}
+                    ),
+                    session_count=len(held_out_sessions),
+                    match_session_count=sum(
+                        1 for session in held_out_sessions if session.label == "match"
+                    ),
+                    negative_group_count=len(set(held_out_pair_set.negative_group_ids)),
+                )
+            )
+            checkpoints[(fold, epoch)] = {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
+
+    selection = select_v2_epoch(fold_history, selection_digest)
+    oof_scores = _selected_oof_scores(
+        held_out_pair_sets,
+        checkpoints,
+        selection=selection,
+        dimension=dimension,
+        rank=config.rank,
+        seed=seed,
+        device=device,
+    )
+
+    def finish(historical_metrics: HistoricalRelativeMetrics) -> V3TrainingResult:
+        full_training_pair_set = build_v2_pair_set(train_sessions)
+        final_model = _fresh_model(
+            dimension=dimension,
+            rank=config.rank,
+            seed=seed,
+            device=device,
+        )
+        final_optimizer = torch.optim.Adam(
+            final_model.parameters(),
+            lr=config.learning_rate,
+        )
+        for _epoch in range(1, selection.epoch + 1):
+            train_v3_epoch(final_model, final_optimizer, full_training_pair_set, config)
+
+        adapted_scores = score_pair_set(final_model, validation_pair_set, device)
+        adapted_threshold = calibrate_threshold(
+            positive_scores=adapted_scores.positive,
+            positive_student_ids=validation_pair_set.positive_student_ids,
+            negative_scores=adapted_scores.negative,
+            negative_group_ids=validation_pair_set.negative_group_ids,
+            dataset_digest=dataset_digest,
+        )
+        raw_scores = _raw_pair_scores(validation_pair_set)
+        raw_threshold = calibrate_threshold(
+            positive_scores=raw_scores.positive,
+            positive_student_ids=validation_pair_set.positive_student_ids,
+            negative_scores=raw_scores.negative,
+            negative_group_ids=validation_pair_set.negative_group_ids,
+            dataset_digest=dataset_digest,
+        )
+        return V3TrainingResult(
+            model=final_model,
+            selection=selection,
+            fold_history=tuple(fold_history),
+            adapted_threshold=adapted_threshold,
+            raw_threshold=raw_threshold,
+            historical_metrics=historical_metrics,
+            dataset_digest=dataset_digest,
+            source_feedback_snapshot=str(canonical_manifest.get("snapshot", "")),
+            split_seed=str(canonical_manifest.get("split_seed", "")),
+            split_counts=_split_counts(
+                canonical_manifest,
+                train_pairs=full_training_pair_set,
+                validation_pairs=validation_pair_set,
+            ),
+            validation_negative_category_counts=(
+                validation_pair_set.negative_category_counts
+            ),
+            validation_negative_category_weight_totals=(
+                validation_pair_set.negative_category_weight_totals
+            ),
+        )
+
+    return continue_after_historical_oof(
+        oof_scores,
+        dataset_digest=selection_digest,
+        continue_fn=finish,
+    )
+
+
+def require_historical_gate(metrics: HistoricalRelativeMetrics) -> None:
+    if not historical_relative_gate_passes(metrics):
+        raise HistoricalGateError(metrics)
+
+
+def historical_metrics_from_oof(
+    scores: OofScores,
+    *,
+    dataset_digest: str,
+) -> HistoricalRelativeMetrics:
+    comparison = compare_at_far_budget(
+        raw_positive_scores=scores.raw_positive,
+        adapted_positive_scores=scores.adapted_positive,
+        positive_student_ids=scores.positive_student_ids,
+        raw_negative_scores=scores.raw_negative,
+        adapted_negative_scores=scores.adapted_negative,
+        negative_group_ids=scores.negative_group_ids,
+        dataset_digest=dataset_digest,
+    )
+    return HistoricalRelativeMetrics(
+        raw_far=comparison.raw.empirical_far,
+        adapted_far=comparison.adapted.empirical_far,
+        recall_lift=comparison.recall_lift,
+        true_match_delta=comparison.true_match_delta,
+        same_threshold_recall_delta=(
+            comparison.same_threshold_adapted_recall
+            - comparison.same_threshold_raw_recall
+        ),
+        adapted_threshold=comparison.adapted.threshold,
+    )
+
+
+def continue_after_historical_oof(
+    scores: OofScores,
+    *,
+    dataset_digest: str,
+    continue_fn: Callable[[HistoricalRelativeMetrics], _T],
+) -> _T:
+    metrics = historical_metrics_from_oof(scores, dataset_digest=dataset_digest)
+    require_historical_gate(metrics)
+    return continue_fn(metrics)
+
+
+def _selected_oof_scores(
+    pair_sets: dict[int, V2PairSet],
+    checkpoints: dict[tuple[int, int], dict[str, Tensor]],
+    *,
+    selection: V2Selection,
+    dimension: int,
+    rank: int,
+    seed: int,
+    device: str,
+) -> OofScores:
+    raw_positive: list[np.ndarray] = []
+    adapted_positive: list[np.ndarray] = []
+    positive_student_ids: list[str] = []
+    raw_negative: list[np.ndarray] = []
+    adapted_negative: list[np.ndarray] = []
+    negative_group_ids: list[str] = []
+    for fold in range(5):
+        pair_set = pair_sets[fold]
+        try:
+            checkpoint = checkpoints[(fold, selection.epoch)]
+        except KeyError as exc:
+            raise ValueError(
+                f"selected epoch {selection.epoch} has no checkpoint for fold {fold}"
+            ) from exc
+        model = _fresh_model(
+            dimension=dimension,
+            rank=rank,
+            seed=seed,
+            device=device,
+        )
+        model.load_state_dict(checkpoint)
+        adapted = score_pair_set(model, pair_set, device)
+        raw = _raw_pair_scores(pair_set)
+        raw_positive.append(raw.positive)
+        adapted_positive.append(adapted.positive)
+        positive_student_ids.extend(pair_set.positive_student_ids)
+        raw_negative.append(raw.negative)
+        adapted_negative.append(adapted.negative)
+        negative_group_ids.extend(pair_set.negative_group_ids)
+    return OofScores(
+        raw_positive=np.concatenate(raw_positive),
+        adapted_positive=np.concatenate(adapted_positive),
+        positive_student_ids=tuple(positive_student_ids),
+        raw_negative=np.concatenate(raw_negative),
+        adapted_negative=np.concatenate(adapted_negative),
+        negative_group_ids=tuple(negative_group_ids),
+    )
+
+
+def _score_v3_validation_loss(
+    model: LowRankDomainAdapter,
+    pair_set: V2PairSet,
+    config: V3TrainingConfig,
+) -> float:
+    previous_mode = model.training
+    try:
+        model.eval()
+        with torch.no_grad():
+            loss = v3_separation_loss(model, pair_set, config)
+    finally:
+        model.train(previous_mode)
+    return float(loss.total.detach().cpu())
+
+
+def write_v3_candidate_artifacts(
+    output_dir: Path,
+    result: V3TrainingResult,
+    seed: int,
+    *,
+    _before_publish: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    output_dir = Path(output_dir)
+    if output_dir.exists():
+        raise FileExistsError(f"output directory already exists: {output_dir}")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    temporary_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent)
+    )
+    os.chmod(temporary_dir, 0o700)
+    try:
+        onnx_path = temporary_dir / "identity_domain_adapter.onnx"
+        parity_error = _export_v2_onnx_with_dynamic_batch_parity(result.model, onnx_path)
+        manifest = _v3_runtime_manifest(
+            result=result,
+            seed=seed,
+            onnx_file=onnx_path.name,
+            onnx_sha256=hashlib.sha256(onnx_path.read_bytes()).hexdigest(),
+            onnx_parity_max_abs_error=parity_error,
+        )
+        _atomic_write_private_json(
+            temporary_dir / "identity_domain_adapter.manifest.json",
+            manifest,
+        )
+        if _before_publish is not None:
+            _before_publish()
+        _publish_directory_no_replace(temporary_dir, output_dir)
+        os.chmod(output_dir, 0o700)
+        for path in output_dir.iterdir():
+            os.chmod(path, 0o600)
+        return manifest
+    except Exception as exc:
+        _preserve_failure_evidence(temporary_dir, exc)
+        raise
+
+
+def _v3_runtime_manifest(
+    *,
+    result: V3TrainingResult,
+    seed: int,
+    onnx_file: str,
+    onnx_sha256: str,
+    onnx_parity_max_abs_error: float,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "model_version": "identity-domain-adapter-v3",
+        "embedding_dimension": result.model.dimension,
+        "rank": result.model.rank,
+        "match_threshold": result.adapted_threshold.threshold,
+        "onnx_file": onnx_file,
+        "onnx_sha256": onnx_sha256,
+        "onnx_parity_max_abs_error": onnx_parity_max_abs_error,
+        "source_dataset_sha256": result.dataset_digest,
+        "source_code_revision": _source_revision(),
+        "split_seed": result.split_seed,
+        "split_counts": result.split_counts,
+        "training_hyperparameters": {"seed": seed},
+        "validation_metrics": asdict(result.adapted_threshold),
+        "test_metrics": None,
+        "input_names": ["ref_embedding", "photo_embedding"],
+        "output_name": "adapted_cosine",
+        "training": {
+            "strategy": "five_fold_student_oof_v3",
+            "fold_schema_version": 1,
+            "fold_seed": "identity-domain-adapter-v2-folds",
+            "fold_count": 5,
+            "fold_counts": _public_fold_summaries(
+                result.fold_history,
+                selected_epoch=result.selection.epoch,
+            ),
+            "selected_epoch": result.selection.epoch,
+            "selection_key": [
+                "median_recall",
+                "worst_fold_recall",
+                "residual_drift",
+                "validation_loss",
+                "earliest_epoch",
+            ],
+            "loss": asdict(V3TrainingConfig()),
+            "positive_weighting": "equal_total_weight_per_student",
+            "negative_construction": "exhaustive_cross_student_ordered_pairs",
+            "negative_weighting": "ordered_student_pair_current_maximum",
+            "ranking_weighting": "equal_reference_student_distinct_photo_students",
+            "negative_categories": {
+                "counts": dict(sorted(result.validation_negative_category_counts.items())),
+                "weights": dict(
+                    sorted(result.validation_negative_category_weight_totals.items())
+                ),
+            },
+            "historical_oof_relative": asdict(result.historical_metrics),
+            "bootstrap": {
+                "iterations": 10000,
+                "seed": bootstrap_seed(result.dataset_digest),
+                "quantile_method": "higher",
+            },
+            "threshold_floor": 0.35,
+            "adapted_threshold": asdict(result.adapted_threshold),
+            "raw_comparator_threshold": asdict(result.raw_threshold),
+            "canonical_dataset_digest": result.dataset_digest,
+        },
+    }
 
 
 def v3_separation_loss(
@@ -254,23 +709,52 @@ def _student_balanced_ranking_loss(
         raise ValueError("positive scores and session IDs must align")
     if negatives.numel() != len(negative_metadata):
         raise ValueError("negative scores and metadata must align")
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if not torch.isfinite(negatives).all():
+        raise ValueError("negative scores must be finite")
     if not positives.numel() or not negatives.numel():
         empty = torch.empty((0,), dtype=torch.int64, device=positives.device)
         base = positives.sum() * 0.0 + negatives.sum() * 0.0
         return (base if zero is None else zero), empty
+
+    score_values = negatives.detach().cpu().numpy()
+    best_by_positive: dict[
+        tuple[str, str],
+        dict[str, tuple[float, tuple[str, str, str, str, int], int]],
+    ] = defaultdict(dict)
+    for index, row in enumerate(negative_metadata):
+        key = (row.ref_student_id, row.ref_session_id)
+        order = (
+            row.ref_student_id,
+            row.ref_session_id,
+            row.photo_student_id,
+            row.photo_session_id,
+            index,
+        )
+        candidate = (float(score_values[index]), order, index)
+        previous = best_by_positive[key].get(row.photo_student_id)
+        if previous is None or candidate[0] > previous[0] or (
+            candidate[0] == previous[0] and candidate[1] < previous[1]
+        ):
+            best_by_positive[key][row.photo_student_id] = candidate
+    selected_by_positive = {
+        key: [
+            item[2]
+            for item in sorted(
+                candidates.values(),
+                key=lambda item: (-item[0], item[1]),
+            )[:limit]
+        ]
+        for key, candidates in best_by_positive.items()
+    }
 
     by_student: dict[str, list[Tensor]] = defaultdict(list)
     flattened_indices: list[int] = []
     for positive_index, (student_id, session_id) in enumerate(
         zip(positive_student_ids, positive_session_ids, strict=True)
     ):
-        selected = distinct_photo_student_hard_negatives(
-            negatives,
-            negative_metadata,
-            positive_student_id=student_id,
-            positive_session_id=session_id,
-            limit=limit,
-        )
+        selected = selected_by_positive.get((student_id, session_id), [])
         if not selected:
             continue
         index_tensor = torch.tensor(selected, dtype=torch.int64, device=negatives.device)
