@@ -231,6 +231,8 @@ def select_v3_epoch(
         -np.inf,
         dtype=np.float64,
     )
+    active_accept_groups = np.any(accept_counts != 0, axis=1)
+    active_accept_counts = accept_counts[active_accept_groups]
     generator = np.random.default_rng(bootstrap_seed(dataset_digest))
     for sample_counts in _iter_bootstrap_sample_counts(
         generator,
@@ -239,7 +241,15 @@ def select_v3_epoch(
         batch_size=128,
     ):
         sampled_sizes = sample_counts @ group_sizes
-        sampled_accepts = sample_counts @ accept_counts
+        if active_accept_counts.shape[0]:
+            sampled_accepts = (
+                sample_counts[:, active_accept_groups] @ active_accept_counts
+            )
+        else:
+            sampled_accepts = np.zeros(
+                (sample_counts.shape[0], len(candidates)),
+                dtype=np.int64,
+            )
         replicates = sampled_accepts / sampled_sizes[:, None]
         top_values[...] = _top_k_higher_quantile_values(
             top_values,
