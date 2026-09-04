@@ -62,4 +62,8 @@ TA 的 `FACE_HTTP_URL` 改成 face-py:32192, 客户端 / 监管平台**零感知
 Phase A.1 (本 commit): 骨架. 服务可启, /health 通, identity_check / compare 返 501 stub.
 Phase A.2-3: 真实现 identity_check + compare.
 Phase A.4: 跨验证 vs face C++ baseline.
+Phase A.7+: `FACE_SESSION_MATCH_CONSENSUS=1` 可开启一个**默认关闭**的 production-shaped
+per-photo 共识候选: 仅在 multi-photo session 的 Stage 1 判定为 `consistent` 后, 把满足
+`[0.30, 0.35)` / 无 quality flag / 无 outlier peer / ≥2 clean match peers 的单张
+`inconclusive` 提升为 `match`. 默认配置保持关闭, 不影响现网客户契约.
 Phase B+: docker, deploy bundle, 切默认.

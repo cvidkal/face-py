@@ -33,7 +33,10 @@ from .errors import (
     msg_photo_unusable, msg_pose_excessive, msg_ref_image_read_failed,
 )
 from .pose_gate import compute_head_pose
-from .quality_gate import QualityGateConfig
+from .quality_gate import (
+    QualityGateConfig, apply_session_match_consensus,
+    session_match_consensus_enabled,
+)
 from .recognizer import (
     FaceRecognizer, classify_match, cosine_score, get_match_thresholds,
     is_same_person, l2_distance,
@@ -574,6 +577,8 @@ class FacePipeline:
                 f"Stage 2: prototype cos={result.session_cos_to_ref:.3f} "
                 f"l2={result.session_l2_to_ref:.3f}"
             )
+            if session_match_consensus_enabled():
+                apply_session_match_consensus(result.photo_results)
             return self._finish_session(result, t0)
 
         except Exception as exc:

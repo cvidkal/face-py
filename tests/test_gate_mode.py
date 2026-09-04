@@ -23,6 +23,7 @@ from module.face.pipeline import (
 )
 from module.face.quality_gate import (
     GATE_MODE_AUDIT, GATE_MODE_BLOCK, QualityGateConfig,
+    session_match_consensus_enabled,
 )
 from module.face.recognizer import cos_to_l2
 
@@ -189,6 +190,39 @@ class EmptyEnvTests(unittest.TestCase):
     def test_real_value_still_wins(self) -> None:
         os.environ["FACE_PHOTO_CONTENT_MIN"] = "25"
         self.assertEqual(QualityGateConfig.from_env().photo_content_min, 25.0)
+
+
+class SessionConsensusSwitchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old = dict(os.environ)
+        os.environ.pop("FACE_SESSION_MATCH_CONSENSUS", None)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old)
+
+    def test_missing_or_falsey_values_disable_consensus(self) -> None:
+        cases = {
+            "missing": None,
+            "empty": "",
+            "zero": "0",
+            "false": "false",
+            "no": "no",
+            "off": "off",
+        }
+        for label, raw in cases.items():
+            with self.subTest(value=label):
+                if raw is None:
+                    os.environ.pop("FACE_SESSION_MATCH_CONSENSUS", None)
+                else:
+                    os.environ["FACE_SESSION_MATCH_CONSENSUS"] = raw
+                self.assertFalse(session_match_consensus_enabled())
+
+    def test_truthy_values_enable_consensus(self) -> None:
+        for raw in ("1", "true"):
+            with self.subTest(value=raw):
+                os.environ["FACE_SESSION_MATCH_CONSENSUS"] = raw
+                self.assertTrue(session_match_consensus_enabled())
 
 
 if __name__ == "__main__":
