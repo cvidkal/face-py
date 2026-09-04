@@ -11,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+from module.face.domain_adapter import DomainAdapterRuntime
 from tools.domain_adapter_training import LowRankDomainAdapter, PairMetadata, SessionEmbedding
 from tools.domain_adapter_v2_metrics import V2PairSet
 from tools.domain_adapter_v2_metrics import CalibratedThreshold
@@ -242,7 +243,7 @@ class V3HistoricalGateTests(unittest.TestCase):
 
 
 class V3ArtifactTests(unittest.TestCase):
-    def _result(self) -> V3TrainingResult:
+    def _result(self, dimension: int = 2) -> V3TrainingResult:
         threshold = CalibratedThreshold(
             threshold=0.35,
             empirical_far=0.005,
@@ -252,7 +253,7 @@ class V3ArtifactTests(unittest.TestCase):
             feasible=True,
         )
         return V3TrainingResult(
-            model=LowRankDomainAdapter(dimension=2, rank=16),
+            model=LowRankDomainAdapter(dimension=dimension, rank=16),
             selection=V2Selection(
                 epoch=1,
                 median_recall=0.5,
@@ -317,6 +318,23 @@ class V3ArtifactTests(unittest.TestCase):
                 all(path.stat().st_mode & 0o777 == 0o600 for path in output.iterdir())
             )
             self.assertLessEqual(manifest["onnx_parity_max_abs_error"], 1e-5)
+
+    def test_v3_artifact_loads_through_the_unchanged_runtime(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "candidate"
+            write_v3_candidate_artifacts(output, self._result(dimension=128), seed=7)
+            onnx_path = output / "identity_domain_adapter.onnx"
+
+            runtime = DomainAdapterRuntime.load("shadow", onnx_path)
+            ref = np.zeros(128, dtype=np.float32)
+            photo = np.zeros(128, dtype=np.float32)
+            ref[0] = 1.0
+            photo[0] = 1.0
+            decision = runtime.compare(ref, photo)
+
+            self.assertTrue(runtime.ready)
+            self.assertEqual(runtime.version, "identity-domain-adapter-v3")
+            self.assertTrue(decision.usable)
 
     def test_artifact_writer_never_overwrites_a_racing_destination(self) -> None:
         with TemporaryDirectory() as tmp:
