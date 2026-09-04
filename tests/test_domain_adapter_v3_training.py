@@ -218,6 +218,27 @@ class V3HistoricalGateTests(unittest.TestCase):
         self.assertEqual(metrics.true_match_delta, 1)
         self.assertEqual(metrics.same_threshold_recall_delta, 0.5)
         self.assertEqual(metrics.adapted_threshold, 0.36)
+        self.assertEqual(metrics.raw_threshold, 0.36)
+
+    def test_oof_adapted_threshold_is_constrained_by_raw_observed_far(self) -> None:
+        raw_negatives = np.full(250, 0.10, dtype=np.float64)
+        raw_negatives[0] = 0.36
+        adapted_negatives = raw_negatives.copy()
+        adapted_negatives[1] = 0.37
+        metrics = historical_metrics_from_oof(
+            OofScores(
+                raw_positive=np.asarray([0.36, 0.34, 0.34]),
+                adapted_positive=np.asarray([0.39, 0.38, 0.351]),
+                positive_student_ids=("A", "B", "C"),
+                raw_negative=raw_negatives,
+                adapted_negative=adapted_negatives,
+                negative_group_ids=tuple(f"G{index}" for index in range(250)),
+            ),
+            dataset_digest="d" * 64,
+        )
+        self.assertLessEqual(metrics.adapted_far, metrics.raw_far)
+        self.assertGreater(metrics.adapted_threshold, 0.35)
+        self.assertAlmostEqual(metrics.recall_lift, 1.0 / 3.0)
 
     def test_failed_oof_gate_never_calls_later_training_or_evidence(self) -> None:
         scores = OofScores(

@@ -50,6 +50,7 @@ def _require_v3_candidate(candidate_dir: Path) -> HistoricalRelativeMetrics:
                 raw_metrics["same_threshold_recall_delta"]
             ),
             adapted_threshold=float(raw_metrics["adapted_threshold"]),
+            raw_threshold=float(raw_metrics.get("raw_threshold", 0.35)),
         )
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError("candidate historical OOF metrics are invalid") from exc
@@ -59,6 +60,7 @@ def _require_v3_candidate(candidate_dir: Path) -> HistoricalRelativeMetrics:
         metrics.recall_lift,
         metrics.same_threshold_recall_delta,
         metrics.adapted_threshold,
+        metrics.raw_threshold,
     )
     if not all(math.isfinite(value) for value in numeric_values):
         raise ValueError("candidate historical OOF metrics must be finite")

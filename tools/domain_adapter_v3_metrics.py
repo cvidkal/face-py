@@ -22,6 +22,7 @@ class HistoricalRelativeMetrics:
     true_match_delta: int
     same_threshold_recall_delta: float
     adapted_threshold: float
+    raw_threshold: float = 0.35
 
 
 def student_balanced_weights(student_ids: Sequence[str]) -> np.ndarray:
@@ -109,6 +110,7 @@ def historical_relative_gate_passes(metrics: HistoricalRelativeMetrics) -> bool:
         metrics.recall_lift,
         metrics.same_threshold_recall_delta,
         metrics.adapted_threshold,
+        metrics.raw_threshold,
     )
     if not all(math.isfinite(value) for value in values):
         return False

@@ -33,6 +33,7 @@ from tools.domain_adapter_v2_metrics import (
     build_v2_pair_set,
     calibrate_threshold,
     compare_at_far_budget,
+    student_balanced_match_recall,
 )
 from tools.domain_adapter_v2_training import (
     FoldEpochMetrics,
@@ -484,17 +485,65 @@ def historical_metrics_from_oof(
         negative_group_ids=scores.negative_group_ids,
         dataset_digest=dataset_digest,
     )
+    adapted_threshold, adapted_far, adapted_recall, adapted_true_matches = (
+        _select_adapted_at_empirical_far(
+            positive_scores=scores.adapted_positive,
+            positive_student_ids=scores.positive_student_ids,
+            negative_scores=scores.adapted_negative,
+            far_ceiling=comparison.raw.empirical_far,
+        )
+    )
     return HistoricalRelativeMetrics(
         raw_far=comparison.raw.empirical_far,
-        adapted_far=comparison.adapted.empirical_far,
-        recall_lift=comparison.recall_lift,
-        true_match_delta=comparison.true_match_delta,
+        adapted_far=adapted_far,
+        recall_lift=adapted_recall - comparison.raw.student_balanced_recall,
+        true_match_delta=adapted_true_matches - comparison.raw.true_matches,
         same_threshold_recall_delta=(
             comparison.same_threshold_adapted_recall
             - comparison.same_threshold_raw_recall
         ),
-        adapted_threshold=comparison.adapted.threshold,
+        adapted_threshold=adapted_threshold,
+        raw_threshold=comparison.raw.threshold,
     )
+
+
+def _select_adapted_at_empirical_far(
+    *,
+    positive_scores: np.ndarray,
+    positive_student_ids: Sequence[str],
+    negative_scores: np.ndarray,
+    far_ceiling: float,
+) -> tuple[float, float, float, int]:
+    positives = np.asarray(positive_scores, dtype=np.float64).reshape(-1)
+    negatives = np.asarray(negative_scores, dtype=np.float64).reshape(-1)
+    if positives.size != len(positive_student_ids):
+        raise ValueError("positive scores and student IDs must align")
+    if not positives.size or not negatives.size:
+        raise ValueError("positive and negative scores must not be empty")
+    best: tuple[tuple[float, float, float], float, float, float, int] | None = None
+    for threshold in np.round(np.arange(0.35, 1.001, 0.001), 3):
+        far = float(np.mean(negatives >= threshold))
+        recall = student_balanced_match_recall(
+            positives,
+            positive_student_ids,
+            float(threshold),
+        )
+        true_matches = int(np.count_nonzero(positives >= threshold))
+        key = (recall, -far, float(threshold))
+        candidate = (key, float(threshold), far, recall, true_matches)
+        if far <= far_ceiling and (best is None or key > best[0]):
+            best = candidate
+    if best is not None:
+        return best[1:]
+
+    threshold = 1.0
+    far = float(np.mean(negatives >= threshold))
+    recall = student_balanced_match_recall(
+        positives,
+        positive_student_ids,
+        threshold,
+    )
+    return threshold, far, recall, int(np.count_nonzero(positives >= threshold))
 
 
 def continue_after_historical_oof(
