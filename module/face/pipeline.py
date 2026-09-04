@@ -15,7 +15,6 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -23,7 +22,8 @@ import numpy as np
 
 from .clarity import compute_image_clarity_score
 from .content_gate import compute_content_score, is_photo_unusable
-from .detector import DetectedFace, FaceAligner, FaceDetector, largest_face
+from .detector import FaceAligner, FaceDetector, largest_face
+from .domain_adapter import DomainAdapterRuntime, load_domain_adapter_from_env
 from .errors import (
     COS_INCONCLUSIVE_ZONE, DETECTION_LOW_CONFIDENCE, FACE_TOO_BLURRY, FACE_TOO_SMALL,
     FEATURE_EXTRACTION_FAILED, IMAGE_READ_FAILED, MISMATCH_WITHHELD_LOW_QUALITY,
@@ -33,7 +33,10 @@ from .errors import (
     msg_photo_unusable, msg_pose_excessive, msg_ref_image_read_failed,
 )
 from .pose_gate import compute_head_pose
-from .quality_gate import QualityGateConfig
+from .quality_gate import (
+    QualityGateConfig, apply_session_match_consensus,
+    session_match_consensus_enabled,
+)
 from .recognizer import (
     FaceRecognizer, classify_match, cosine_score, get_match_thresholds,
     is_same_person, l2_distance,
@@ -164,6 +167,13 @@ class SessionCheckResult:
     outlier_sequence_nos: list[int] = field(default_factory=list)
     session_cos_to_ref: Optional[float] = None
     session_l2_to_ref: Optional[float] = None
+    raw_session_status: str = ""
+    adapted_session_status: str = ""
+    adapted_session_cos_to_ref: Optional[float] = None
+    adapter_mode: str = ""
+    adapter_version: str = ""
+    adapter_sha256: str = ""
+    decision_source: str = ""
     n_photos: int = 0
     n_post_gate: int = 0
     reason: str = ""
@@ -177,6 +187,13 @@ class SessionCheckResult:
             "outlier_sequence_nos": self.outlier_sequence_nos,
             "session_cos_to_ref": self.session_cos_to_ref,
             "session_l2_to_ref": self.session_l2_to_ref,
+            "raw_session_status": self.raw_session_status,
+            "adapted_session_status": self.adapted_session_status,
+            "adapted_session_cos_to_ref": self.adapted_session_cos_to_ref,
+            "adapter_mode": self.adapter_mode,
+            "adapter_version": self.adapter_version,
+            "adapter_sha256": self.adapter_sha256,
+            "decision_source": self.decision_source,
             "n_photos": self.n_photos,
             "n_post_gate": self.n_post_gate,
             "reason": self.reason,
@@ -256,6 +273,7 @@ class FacePipeline:
     recognizer: FaceRecognizer
     quality: QualityGateConfig = field(default_factory=QualityGateConfig.from_env)
     ref_cache: RefFeatureCache = field(default_factory=RefFeatureCache)
+    domain_adapter: DomainAdapterRuntime = field(default_factory=DomainAdapterRuntime)
 
     # ----- identity_check -----
 
@@ -447,7 +465,12 @@ class FacePipeline:
         Outlier session also reports session_cos_to_ref of the majority core
         (excluding outliers) as a diagnostic — does not change session_status.
         """
-        result = SessionCheckResult()
+        result = SessionCheckResult(
+            adapter_mode=self.domain_adapter.mode,
+            adapter_version=self.domain_adapter.version,
+            adapter_sha256=self.domain_adapter.artifact_sha256,
+            decision_source="raw_stage1",
+        )
         result.n_photos = len(photos)
         t0 = time.perf_counter()
 
@@ -514,14 +537,11 @@ class FacePipeline:
             if result.n_post_gate == 1:
                 # Skip Stage 1, run Stage 2 on single photo
                 emb = embeddings[0]
-                cos_v = cosine_score(emb, emb_ref)
-                l2_v = float(l2_distance(emb, emb_ref))
-                result.session_cos_to_ref = cos_v
-                result.session_l2_to_ref = l2_v
-                result.session_status = classify_match(cos_v, l2_v)
+                self._apply_session_stage_two(result, emb_ref, emb)
                 result.internal_consistency = "single"
                 result.reason = (f"single post-gate photo, "
-                                  f"cos={cos_v:.3f} l2={l2_v:.3f}")
+                                  f"cos={result.session_cos_to_ref:.3f} "
+                                  f"l2={result.session_l2_to_ref:.3f}")
                 return self._finish_session(result, t0)
 
             # Stage 1
@@ -552,18 +572,60 @@ class FacePipeline:
             # Stage 2 — prototype of all post-gate photos vs ref
             result.internal_consistency = "consistent"
             proto = session_prototype(embeddings)
-            cos_v = cosine_score(proto, emb_ref)
-            l2_v = float(l2_distance(proto, emb_ref))
-            result.session_cos_to_ref = cos_v
-            result.session_l2_to_ref = l2_v
-            result.session_status = classify_match(cos_v, l2_v)
-            result.reason = (f"Stage 2: prototype cos={cos_v:.3f} l2={l2_v:.3f}")
+            self._apply_session_stage_two(result, emb_ref, proto)
+            result.reason = (
+                f"Stage 2: prototype cos={result.session_cos_to_ref:.3f} "
+                f"l2={result.session_l2_to_ref:.3f}"
+            )
+            if session_match_consensus_enabled():
+                apply_session_match_consensus(result.photo_results)
             return self._finish_session(result, t0)
 
         except Exception as exc:
             result.session_status = "inconclusive"
             result.reason = f"unexpected error: {exc}"
             return self._finish_session(result, t0)
+
+    def _apply_session_stage_two(
+        self,
+        result: SessionCheckResult,
+        ref_embedding: np.ndarray,
+        prototype: np.ndarray,
+    ) -> None:
+        """Apply optional adapted scoring after raw Stage 1 has allowed Stage 2."""
+        raw_cosine = cosine_score(prototype, ref_embedding)
+        raw_l2 = float(l2_distance(prototype, ref_embedding))
+        raw_status = classify_match(raw_cosine, raw_l2)
+        result.session_cos_to_ref = raw_cosine
+        result.session_l2_to_ref = raw_l2
+        result.raw_session_status = raw_status
+        result.session_status = raw_status
+
+        adapter = self.domain_adapter
+        if adapter.mode == "off":
+            result.decision_source = "raw_adapter_off"
+            return
+        if not adapter.ready:
+            result.decision_source = "raw_adapter_unready"
+            return
+
+        try:
+            decision = adapter.compare(ref_embedding, prototype)
+        except Exception:
+            result.decision_source = "raw_adapter_fallback"
+            return
+        if not decision.usable:
+            result.decision_source = "raw_adapter_fallback"
+            return
+
+        result.adapted_session_status = decision.status
+        result.adapted_session_cos_to_ref = decision.cosine
+        if adapter.mode == "shadow":
+            result.decision_source = "raw_shadow"
+            return
+
+        result.session_status = decision.status
+        result.decision_source = "domain_adapter"
 
     def _process_photo_for_session(self, p: dict) -> "SessionPhotoResult":
         """Run gates + (if passing) extract embedding for one photo.
@@ -710,4 +772,9 @@ def build_pipeline_from_env() -> FacePipeline:
     detector = FaceDetector(detect_path)
     aligner = FaceAligner(recognize_path)
     recognizer = FaceRecognizer(recognize_path, device=device)
-    return FacePipeline(detector=detector, aligner=aligner, recognizer=recognizer)
+    return FacePipeline(
+        detector=detector,
+        aligner=aligner,
+        recognizer=recognizer,
+        domain_adapter=load_domain_adapter_from_env(),
+    )

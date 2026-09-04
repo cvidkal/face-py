@@ -28,6 +28,13 @@ services:
     volumes:
       # 模型文件 — 不打镜像 (大且 gitignored)
       - ./models:/app/models:ro
+      # Optional adapter artifact — host data only, never baked into the image.
+      - type: bind
+        source: ./models/identity-domain-adapter
+        target: /models/identity-domain-adapter
+        read_only: true
+        bind:
+          create_host_path: false
       # 客户图像数据 — 跟 face C++ 容器同款挂载点, TA 发的绝对路径在容器内可读
       - /var/lib/training_analyzer/sessions:/var/lib/training_analyzer/sessions:ro
 
@@ -44,4 +51,10 @@ services:
       - deploy/env/prod.env
     volumes:
       - ./models:/app/models:ro
+      - type: bind
+        source: ./models/identity-domain-adapter
+        target: /models/identity-domain-adapter
+        read_only: true
+        bind:
+          create_host_path: false
       - /var/lib/training_analyzer/sessions:/var/lib/training_analyzer/sessions:ro
